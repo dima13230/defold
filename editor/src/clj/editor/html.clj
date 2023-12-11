@@ -14,24 +14,20 @@
 
 (ns editor.html
   (:require [dynamo.graph :as g]
-            [editor.code.resource :as r]
-            [editor.code.lang.html :as html]
+            [editor.resource-node :as resource-node]
             [editor.workspace :as workspace]))
 
-(def ^:private html-opts {:code {:grammar html/grammar}})
-
 (g/defnode HtmlNode
-  (inherits r/CodeEditorResourceNode)
+  (inherits resource-node/ResourceNode)
 
   (output html g/Str (g/fnk [resource] (slurp resource :encoding "UTF-8"))))
 
 (defn register-resource-types
   [workspace]
-  (r/register-code-resource-type workspace
+  (workspace/register-resource-type workspace
                                     :ext "html"
                                     :label "HTML"
                                     :textual? true
                                     :node-type HtmlNode
-                                    :view-types [:html :code]
-                                    :view-opts html-opts))
-
+                                    :view-types [:html]
+                                    :view-opts nil))
