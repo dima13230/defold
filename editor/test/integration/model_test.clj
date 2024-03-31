@@ -1,4 +1,4 @@
-;; Copyright 2020-2023 The Defold Foundation
+;; Copyright 2020-2024 The Defold Foundation
 ;; Copyright 2014-2020 King
 ;; Copyright 2009-2014 Ragnar Svensson, Christian Murray
 ;; Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -15,19 +15,20 @@
 (ns integration.model-test
   (:require [clojure.test :refer :all]
             [dynamo.graph :as g]
-            [editor.protobuf :as protobuf]
-            [integration.test-util :as test-util]
-            [editor.workspace :as workspace]
-            [editor.types :as types]
             [editor.properties :as properties]
+            [editor.protobuf :as protobuf]
+            [editor.types :as types]
+            [editor.workspace :as workspace]
+            [integration.test-util :as test-util]
             [util.murmur :as murmur])
-  (:import [javax.vecmath Point3d]
-           [com.dynamo.gamesys.proto ModelProto$ModelDesc]))
+  (:import [com.dynamo.gamesys.proto ModelProto$ModelDesc]
+           [javax.vecmath Point3d]))
 
 (deftest aabb
   (test-util/with-loaded-project
     (let [node-id (test-util/resource-node project "/model/test.model")
-          aabb (g/node-value node-id :aabb)
+          scene (g/node-value node-id :scene)
+          aabb (:aabb scene)
           min ^Point3d (types/min-p aabb)
           max ^Point3d (types/max-p aabb)]
       (is (< 10 (.distance max min))))))

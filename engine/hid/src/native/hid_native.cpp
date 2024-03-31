@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -19,6 +19,9 @@
 #include <dlib/utf8.h>
 #include <dlib/dstrings.h>
 #include <dlib/math.h>
+
+// TODO: Migrate last bits of glfw from this file
+#include <glfw/glfw.h>
 
 #include <platform/platform_window.h>
 
@@ -182,6 +185,7 @@ namespace dmHID
                 return false;
             }
 
+            assert(context->m_Window && "No window has been set.");
             dmPlatform::SetKeyboardCharCallback(context->m_Window, GLFWAddKeyboardChar, (void*) context);
             dmPlatform::SetKeyboardMarkedTextCallback(context->m_Window, GLFWSetMarkedText, (void*) context);
             dmPlatform::SetKeyboardDeviceChangedCallback(context->m_Window, GLFWDeviceChangedCallback, (void*) context);
@@ -228,7 +232,11 @@ namespace dmHID
                 {
                     uint32_t mask = 1;
                     mask <<= i % 32;
-                    int state = dmPlatform::GetKey(context->m_Window, i);
+
+                    Key key       = (Key) i;
+                    int key_value = GetKeyValue(key);
+                    int state     = dmPlatform::GetKey(context->m_Window, key_value);
+
                     if (state == GLFW_PRESS)
                         keyboard->m_Packet.m_Keys[i / 32] |= mask;
                     else
@@ -252,7 +260,10 @@ namespace dmHID
                 {
                     uint32_t mask = 1;
                     mask <<= i % 32;
-                    int state = dmPlatform::GetMouseButton(context->m_Window, i);
+
+                    int button_value = GetMouseButtonValue((MouseButton) i);
+                    int state        = dmPlatform::GetMouseButton(context->m_Window, button_value);
+
                     if (state == GLFW_PRESS)
                         packet.m_Buttons[i / 32] |= mask;
                     else
@@ -341,58 +352,8 @@ namespace dmHID
         driver->m_GetGamepadDeviceName(context, driver, gamepad, buffer, buffer_length);
     }
 
-    void ShowKeyboard(HContext context, KeyboardType type, bool autoclose)
-    {
-        dmPlatform::DeviceState device_state;
-
-        switch (type)
-        {
-            case KEYBOARD_TYPE_DEFAULT:
-                device_state = dmPlatform::DEVICE_STATE_KEYBOARD_DEFAULT;
-                break;
-            case KEYBOARD_TYPE_NUMBER_PAD:
-                device_state = dmPlatform::DEVICE_STATE_KEYBOARD_NUMBER_PAD;
-                break;
-            case KEYBOARD_TYPE_EMAIL:
-                device_state = dmPlatform::DEVICE_STATE_KEYBOARD_EMAIL;
-                break;
-            case KEYBOARD_TYPE_PASSWORD:
-                device_state = dmPlatform::DEVICE_STATE_KEYBOARD_PASSWORD;
-                break;
-            default:
-                dmLogWarning("Unknown keyboard type %d\n", type);
-        }
-
-        dmPlatform::SetDeviceState(context->m_Window, device_state, true, autoclose);
-    }
-
-    void HideKeyboard(HContext context)
-    {
-        dmPlatform::SetDeviceState(context->m_Window, dmPlatform::DEVICE_STATE_KEYBOARD_DEFAULT, false);
-    }
-
     void ResetKeyboard(HContext context)
     {
         glfwResetKeyboard();
-    }
-
-    void EnableAccelerometer(HContext context)
-    {
-        dmPlatform::SetDeviceState(context->m_Window, dmPlatform::DEVICE_STATE_ACCELEROMETER, true);
-    }
-
-    void ShowMouseCursor(HContext context)
-    {
-        dmPlatform::SetDeviceState(context->m_Window, dmPlatform::DEVICE_STATE_CURSOR, true);
-    }
-
-    void HideMouseCursor(HContext context)
-    {
-        dmPlatform::SetDeviceState(context->m_Window, dmPlatform::DEVICE_STATE_CURSOR, false);
-    }
-
-    bool GetCursorVisible(HContext context)
-    {
-        return !dmPlatform::GetDeviceState(context->m_Window, dmPlatform::DEVICE_STATE_CURSOR_LOCK);
     }
 }

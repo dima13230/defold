@@ -1,4 +1,4 @@
-;; Copyright 2020-2023 The Defold Foundation
+;; Copyright 2020-2024 The Defold Foundation
 ;; Copyright 2014-2020 King
 ;; Copyright 2009-2014 Ragnar Svensson, Christian Murray
 ;; Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -63,7 +63,7 @@
   (with-clean-system
     (let [[_workspace project] (setup-scratch world)
           atlas-id (test-util/resource-node project "/switcher/switcher.atlas")]
-      (asset-browser/rename (g/node-value atlas-id :resource) "/switcher/switcher2.atlas")
+      (asset-browser/rename [(g/node-value atlas-id :resource)] "switcher2")
       (is (not (g/error? (project/all-save-data project)))))))
 
 (defn- resource-line-endings

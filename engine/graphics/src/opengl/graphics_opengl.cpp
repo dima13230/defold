@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -21,7 +21,7 @@
 #include <dlib/hash.h>
 #include <dlib/align.h>
 #include <dlib/array.h>
-#include <dlib/index_pool.h>
+#include <dlib/thread.h>
 #include <dlib/time.h>
 #include <dmsdk/dlib/vmath.h>
 #include <dmsdk/dlib/dstrings.h>
@@ -35,7 +35,6 @@
 #include "../graphics_private.h"
 #include "../graphics_native.h"
 #include "../graphics_adapter.h"
-#include "async/job_queue.h"
 #include "graphics_opengl_private.h"
 
 #if defined(DM_PLATFORM_MACOS)
@@ -43,8 +42,8 @@
 #include <Carbon/Carbon.h>
 #endif
 
-#include <dmsdk/graphics/glfw/glfw.h>
-#include <graphics/glfw/glfw_native.h>
+#include <glfw/glfw.h>
+#include  <glfw/glfw_native.h>
 
 #if defined(__linux__) && !defined(ANDROID)
     #include <GL/glext.h>
@@ -357,15 +356,7 @@ static void LogFrameBufferError(GLenum status)
 
     DM_REGISTER_GRAPHICS_ADAPTER(GraphicsAdapterOpenGL, &g_opengl_adapter, OpenGLIsSupported, OpenGLRegisterFunctionTable, g_null_adapter_priority);
 
-    struct TextureParamsAsync
-    {
-        HTexture m_Texture;
-        TextureParams m_Params;
-    };
-    dmArray<TextureParamsAsync> g_TextureParamsAsyncArray;
-    dmIndexPool16 g_TextureParamsAsyncArrayIndices;
-    dmArray<HTexture> g_PostDeleteTexturesArray;
-    static void PostDeleteTextures(bool);
+    static void PostDeleteTextures(OpenGLContext*, bool);
     static bool OpenGLInitialize(HContext context);
 
     extern GLenum TEXTURE_UNIT_NAMES[32];
@@ -409,6 +400,13 @@ static void LogFrameBufferError(GLenum status)
         m_Width                   = params.m_Width;
         m_Height                  = params.m_Height;
         m_Window                  = params.m_Window;
+        m_JobThread               = params.m_JobThread;
+
+        // We need to have some sort of valid default filtering
+        if (m_DefaultTextureMinFilter == TEXTURE_FILTER_DEFAULT)
+            m_DefaultTextureMinFilter = TEXTURE_FILTER_LINEAR;
+        if (m_DefaultTextureMagFilter == TEXTURE_FILTER_DEFAULT)
+            m_DefaultTextureMagFilter = TEXTURE_FILTER_LINEAR;
 
         assert(dmPlatform::GetWindowStateParam(m_Window, dmPlatform::WINDOW_STATE_OPENED));
 
@@ -516,12 +514,52 @@ static void LogFrameBufferError(GLenum status)
         return GL_FALSE;
     }
 
+    static int WorkerAcquireContextRunner(void* _context, void* _acquire_flag)
+    {
+        OpenGLContext* context = (OpenGLContext*) _context;
+        bool acquire_flag = (uintptr_t) _acquire_flag;
+        assert(context->m_AuxContextJobPending);
+
+        if (acquire_flag)
+        {
+            context->m_AuxContext = dmPlatform::AcquireAuxContext(context->m_Window);
+        }
+        else
+        {
+            dmPlatform::UnacquireAuxContext(context->m_Window, context->m_AuxContext);
+        }
+
+        context->m_AuxContextJobPending = false;
+
+        return 0;
+    }
+
+    static void AcquireAuxContextOnThread(OpenGLContext* context, bool acquire_flag)
+    {
+        if (!context->m_AsyncProcessingSupport)
+            return;
+        if (!context->m_JobThread)
+            return;
+
+        // TODO: If we have multiple workers, we need to either tag one of them as a graphics-only worker,
+        //       or create multiple aux contexts and do an acquire for each of them.
+        //       But since we only have one worker thread right now, we can leave that for when we have more.
+        assert(dmJobThread::GetWorkerCount(context->m_JobThread) == 1);
+
+        context->m_AuxContextJobPending = true;
+        dmJobThread::PushJob(context->m_JobThread, WorkerAcquireContextRunner, 0, (void*) context, (void*) (uintptr_t) acquire_flag);
+
+        while(context->m_AuxContextJobPending)
+        {
+            dmTime::Sleep(100);
+        }
+    }
+
     static HContext OpenGLNewContext(const ContextParams& params)
     {
         if (g_Context == 0x0)
         {
-            g_Context               = new OpenGLContext(params);
-            g_Context->m_AsyncMutex = dmMutex::New();
+            g_Context = new OpenGLContext(params);
 
             if (OpenGLInitialize(g_Context))
             {
@@ -538,10 +576,8 @@ static void LogFrameBufferError(GLenum status)
         OpenGLContext* context = (OpenGLContext*) _context;
         if (context != 0x0)
         {
-            if(g_Context->m_AsyncMutex)
-            {
-                dmMutex::Delete(g_Context->m_AsyncMutex);
-            }
+            AcquireAuxContextOnThread(context, false);
+            ResetSetTextureAsyncState(context->m_SetTextureAsyncState);
             delete context;
             g_Context = 0x0;
         }
@@ -607,11 +643,11 @@ static void LogFrameBufferError(GLenum status)
         {
             case CONTEXT_FEATURE_MULTI_TARGET_RENDERING: return context->m_MultiTargetRenderingSupport;
             case CONTEXT_FEATURE_TEXTURE_ARRAY:          return context->m_TextureArraySupport;
-            case CONTEXT_FEATURE_COMPUTE_SHADER:         return false; // TODO!
+            case CONTEXT_FEATURE_COMPUTE_SHADER:         return context->m_ComputeSupport;
+            case CONTEXT_FEATURE_STORAGE_BUFFER:         return context->m_StorageBufferSupport;
         }
         return false;
     }
-
 
     static uintptr_t GetExtProcAddress(const char* name, const char* extension_name, const char* core_name, HContext context)
     {
@@ -744,6 +780,7 @@ static void LogFrameBufferError(GLenum status)
             dmLogInfo("  %s", #feature);
         PRINT_FEATURE_IF_SUPPORTED(CONTEXT_FEATURE_MULTI_TARGET_RENDERING);
         PRINT_FEATURE_IF_SUPPORTED(CONTEXT_FEATURE_TEXTURE_ARRAY);
+        PRINT_FEATURE_IF_SUPPORTED(CONTEXT_FEATURE_COMPUTE_SHADER);
     #undef PRINT_FEATURE_IF_SUPPORTED
     }
 
@@ -902,14 +939,6 @@ static void LogFrameBufferError(GLenum status)
         emscripten_webgl_enable_extension(emscripten_ctx, "WEBGL_lose_context");
         emscripten_webgl_enable_extension(emscripten_ctx, "WEBGL_multi_draw");
 #endif
-
-        if (context->m_PrintDeviceInfo)
-        {
-            dmLogInfo("Device: OpenGL");
-            dmLogInfo("Renderer: %s", (char *) glGetString(GL_RENDERER));
-            dmLogInfo("Version: %s", (char *) glGetString(GL_VERSION));
-            dmLogInfo("Vendor: %s", (char *) glGetString(GL_VENDOR));
-        }
 
 #if defined(DM_PLATFORM_MACOS)
         ProcessSerialNumber psn;
@@ -1103,7 +1132,7 @@ static void LogFrameBufferError(GLenum status)
             glBindTexture(GL_TEXTURE_2D_ARRAY, texture);
             DMGRAPHICS_COMPRESSED_TEX_IMAGE_3D(GL_TEXTURE_2D_ARRAY, 0, DMGRAPHICS_TEXTURE_FORMAT_RGBA_ASTC_4x4_KHR, 4, 4, 2, 0, 32, &fakeZeroBuffer);
             GLint err = glGetError();
-            if (err != 0) 
+            if (err != 0)
             {
                 context->m_TextureFormatSupport &= ~(1 << TEXTURE_FORMAT_RGBA_ASTC_4x4);
             }
@@ -1142,7 +1171,6 @@ static void LogFrameBufferError(GLenum status)
         // Hardcoded values for iOS and Android for now. The value is a hint, max number of vertices will still work with performance penalty
         // The below seems to be the reported sweet spot for modern or semi-modern hardware
         context->m_MaxElementVertices = 1024*1024;
-        context->m_MaxElementIndices = 1024*1024;
 #else
         // We don't accept values lower than 65k. It's a trade-off on drawcalls vs bufferdata upload
         GLint gl_max_elem_verts = 65536;
@@ -1157,7 +1185,6 @@ static void LogFrameBufferError(GLenum status)
         if (!legacy) {
             glGetIntegerv(GL_MAX_ELEMENTS_INDICES, &gl_max_elem_indices);
         }
-        context->m_MaxElementIndices = dmMath::Max(65536, gl_max_elem_indices);
         CLEAR_GL_ERROR;
 #endif
 
@@ -1185,7 +1212,8 @@ static void LogFrameBufferError(GLenum status)
         }
 
 #if defined(__ANDROID__) || defined(__arm__) || defined(__arm64__) || defined(__EMSCRIPTEN__)
-        if ((OpenGLIsExtensionSupported(context, "GL_OES_element_index_uint")))
+        if (OpenGLIsExtensionSupported(context, "GL_OES_element_index_uint") ||
+            OpenGLIsExtensionSupported(context, "OES_element_index_uint"))
         {
             context->m_IndexBufferFormatSupport |= 1 << INDEXBUFFER_FORMAT_32;
         }
@@ -1206,18 +1234,43 @@ static void LogFrameBufferError(GLenum status)
         CLEAR_GL_ERROR;
 #endif
 
+    #ifdef DM_HAVE_PLATFORM_COMPUTE_SUPPORT
+        int32_t version_major = 0, version_minor = 0;
+        glGetIntegerv(GL_MAJOR_VERSION, &version_major);
+        glGetIntegerv(GL_MINOR_VERSION, &version_minor);
+
+        #define COMPUTE_VERSION_NEEDED(MAJOR, MINOR) (MAJOR > version_major || (version_major ==  MAJOR && version_minor >= MINOR))
+
+        #if defined(GL_ES_VERSION_3_0) || defined(GL_ES_VERSION_2_0)
+            context->m_ComputeSupport = COMPUTE_VERSION_NEEDED(3,1);
+        #else
+            context->m_ComputeSupport = COMPUTE_VERSION_NEEDED(4,3);
+        #endif
+
+        #undef COMPUTE_VERSION_NEEDED
+    #endif
+
         if (context->m_PrintDeviceInfo)
         {
             OpenGLPrintDeviceInfo(context);
         }
 
-        JobQueueInitialize();
-        if(JobQueueIsAsync())
+        context->m_AsyncProcessingSupport = dmThread::PlatformHasThreadSupport() && dmPlatform::GetWindowStateParam(context->m_Window, dmPlatform::WINDOW_STATE_AUX_CONTEXT);
+        if (context->m_AsyncProcessingSupport)
         {
-            if(!ValidateAsyncJobProcessing(context))
+            AcquireAuxContextOnThread(context, true);
+
+            InitializeSetTextureAsyncState(context->m_SetTextureAsyncState);
+
+            if (context->m_JobThread == 0x0)
+            {
+                dmLogError("AsyncInitialize: Platform has async support but no job thread. Fallback to single thread processing.");
+                context->m_AsyncProcessingSupport = 0;
+            }
+            else if(!ValidateAsyncJobProcessing(context))
             {
                 dmLogDebug("AsyncInitialize: Failed to verify async job processing. Fallback to single thread processing.");
-                JobQueueFinalize();
+                context->m_AsyncProcessingSupport = 0;
             }
         }
 
@@ -1245,8 +1298,7 @@ static void LogFrameBufferError(GLenum status)
         OpenGLContext* context = (OpenGLContext*) _context;
         if (dmPlatform::GetWindowStateParam(context->m_Window, dmPlatform::WINDOW_STATE_OPENED))
         {
-            JobQueueFinalize();
-            PostDeleteTextures(true);
+            PostDeleteTextures(context, true);
 
             context->m_Width = 0;
             context->m_Height = 0;
@@ -1360,7 +1412,7 @@ static void LogFrameBufferError(GLenum status)
     static void OpenGLFlip(HContext context)
     {
         DM_PROFILE(__FUNCTION__);
-        PostDeleteTextures(false);
+        PostDeleteTextures((OpenGLContext*) context, false);
         glfwSwapBuffers();
         CHECK_GL_ERROR;
     }
@@ -1480,11 +1532,6 @@ static void LogFrameBufferError(GLenum status)
         return (((OpenGLContext*) context)->m_IndexBufferFormatSupport & (1 << format)) != 0;
     }
 
-    static uint32_t OpenGLGetMaxElementIndices(HContext context)
-    {
-        return ((OpenGLContext*) context)->m_MaxElementIndices;
-    }
-
     // NOTE: This function doesn't seem to be used anywhere?
     static uint32_t OpenGLGetMaxElementsIndices(HContext context)
     {
@@ -1504,64 +1551,20 @@ static void LogFrameBufferError(GLenum status)
         memset(vd, 0, sizeof(VertexDeclaration));
 
         vd->m_Stride = 0;
-
         for (uint32_t i=0; i<stream_declaration->m_StreamCount; i++)
         {
-            vd->m_Streams[i].m_NameHash      = stream_declaration->m_Streams[i].m_NameHash;
-            vd->m_Streams[i].m_LogicalIndex  = i;
-            vd->m_Streams[i].m_PhysicalIndex = -1;
-            vd->m_Streams[i].m_Size          = stream_declaration->m_Streams[i].m_Size;
-            vd->m_Streams[i].m_Type          = stream_declaration->m_Streams[i].m_Type;
-            vd->m_Streams[i].m_Normalize     = stream_declaration->m_Streams[i].m_Normalize;
-            vd->m_Streams[i].m_Offset        = vd->m_Stride;
+            vd->m_Streams[i].m_NameHash  = stream_declaration->m_Streams[i].m_NameHash;
+            vd->m_Streams[i].m_Location  = -1;
+            vd->m_Streams[i].m_Size      = stream_declaration->m_Streams[i].m_Size;
+            vd->m_Streams[i].m_Type      = stream_declaration->m_Streams[i].m_Type;
+            vd->m_Streams[i].m_Normalize = stream_declaration->m_Streams[i].m_Normalize;
+            vd->m_Streams[i].m_Offset    = vd->m_Stride;
 
             vd->m_Stride += stream_declaration->m_Streams[i].m_Size * GetTypeSize(stream_declaration->m_Streams[i].m_Type);
         }
         vd->m_StreamCount = stream_declaration->m_StreamCount;
 
         return vd;
-    }
-
-    static bool OpenGLSetStreamOffset(HVertexDeclaration vertex_declaration, uint32_t stream_index, uint16_t offset)
-    {
-        if (stream_index >= vertex_declaration->m_StreamCount) {
-            return false;
-        }
-        vertex_declaration->m_Streams[stream_index].m_Offset = offset;
-        return true;
-    }
-
-    static void OpenGLDeleteVertexDeclaration(HVertexDeclaration vertex_declaration)
-    {
-        delete vertex_declaration;
-    }
-
-    static void OpenGLEnableVertexDeclaration(HContext context, HVertexDeclaration vertex_declaration, HVertexBuffer vertex_buffer)
-    {
-        assert(context);
-        assert(vertex_buffer);
-        assert(vertex_declaration);
-        #define BUFFER_OFFSET(i) ((char*)0x0 + (i))
-
-        glBindBufferARB(GL_ARRAY_BUFFER, vertex_buffer);
-        CHECK_GL_ERROR;
-
-        for (uint32_t i=0; i<vertex_declaration->m_StreamCount; i++)
-        {
-            glEnableVertexAttribArray(vertex_declaration->m_Streams[i].m_LogicalIndex);
-            CHECK_GL_ERROR;
-            glVertexAttribPointer(
-                    vertex_declaration->m_Streams[i].m_LogicalIndex,
-                    vertex_declaration->m_Streams[i].m_Size,
-                    GetOpenGLType(vertex_declaration->m_Streams[i].m_Type),
-                    vertex_declaration->m_Streams[i].m_Normalize,
-                    vertex_declaration->m_Stride,
-            BUFFER_OFFSET(vertex_declaration->m_Streams[i].m_Offset) );   //The starting point of the VBO, for the vertices
-
-            CHECK_GL_ERROR;
-        }
-
-        #undef BUFFER_OFFSET
     }
 
     static void BindVertexDeclarationProgram(HContext context, HVertexDeclaration vertex_declaration, HProgram program)
@@ -1583,14 +1586,14 @@ static void LogFrameBufferError(GLenum status)
 
             if (location != -1)
             {
-                streams[i].m_PhysicalIndex = location;
+                streams[i].m_Location = location;
             }
             else
             {
                 CLEAR_GL_ERROR
                 // TODO: Disabled irritating warning? Should we care about not used streams?
                 //dmLogWarning("Vertex attribute %s is not active or defined", streams[i].m_Name);
-                streams[i].m_PhysicalIndex = -1;
+                streams[i].m_Location = -1;
             }
         }
 
@@ -1598,10 +1601,20 @@ static void LogFrameBufferError(GLenum status)
         vertex_declaration->m_ModificationVersion = ((OpenGLContext*) context)->m_ModificationVersion;
     }
 
-    static void OpenGLEnableVertexDeclarationProgram(HContext _context, HVertexDeclaration vertex_declaration, HVertexBuffer vertex_buffer, HProgram program)
+    static void OpenGLEnableVertexBuffer(HContext context, HVertexBuffer vertex_buffer, uint32_t binding_index)
+    {
+        glBindBufferARB(GL_ARRAY_BUFFER, vertex_buffer);
+        CHECK_GL_ERROR;
+    }
+
+    static void OpenGLDisableVertexBuffer(HContext context, HVertexBuffer vertex_buffer)
+    {
+        // NOP
+    }
+
+    static void OpenGLEnableVertexDeclaration(HContext _context, HVertexDeclaration vertex_declaration, uint32_t binding_index, HProgram program)
     {
         assert(_context);
-        assert(vertex_buffer);
         assert(vertex_declaration);
 
         OpenGLContext* context = (OpenGLContext*) _context;
@@ -1613,17 +1626,14 @@ static void LogFrameBufferError(GLenum status)
 
         #define BUFFER_OFFSET(i) ((char*)0x0 + (i))
 
-        glBindBufferARB(GL_ARRAY_BUFFER, vertex_buffer);
-        CHECK_GL_ERROR;
-
         for (uint32_t i=0; i<vertex_declaration->m_StreamCount; i++)
         {
-            if (vertex_declaration->m_Streams[i].m_PhysicalIndex != -1)
+            if (vertex_declaration->m_Streams[i].m_Location != -1)
             {
-                glEnableVertexAttribArray(vertex_declaration->m_Streams[i].m_PhysicalIndex);
+                glEnableVertexAttribArray(vertex_declaration->m_Streams[i].m_Location);
                 CHECK_GL_ERROR;
                 glVertexAttribPointer(
-                        vertex_declaration->m_Streams[i].m_PhysicalIndex,
+                        vertex_declaration->m_Streams[i].m_Location,
                         vertex_declaration->m_Streams[i].m_Size,
                         GetOpenGLType(vertex_declaration->m_Streams[i].m_Type),
                         vertex_declaration->m_Streams[i].m_Normalize,
@@ -1644,9 +1654,9 @@ static void LogFrameBufferError(GLenum status)
 
         for (uint32_t i=0; i<vertex_declaration->m_StreamCount; i++)
         {
-            if (vertex_declaration->m_Streams[i].m_PhysicalIndex != -1)
+            if (vertex_declaration->m_Streams[i].m_Location != -1)
             {
-                glDisableVertexAttribArray(vertex_declaration->m_Streams[i].m_PhysicalIndex);
+                glDisableVertexAttribArray(vertex_declaration->m_Streams[i].m_Location);
                 CHECK_GL_ERROR;
             }
         }
@@ -1656,30 +1666,6 @@ static void LogFrameBufferError(GLenum status)
 
         glBindBufferARB(GL_ELEMENT_ARRAY_BUFFER_ARB, 0);
         CHECK_GL_ERROR;
-    }
-
-    static void OpenGLHashVertexDeclaration(HashState32* state, HVertexDeclaration vertex_declaration)
-    {
-        dmHashUpdateBuffer32(state, vertex_declaration->m_Streams, sizeof(VertexDeclaration::Stream) * vertex_declaration->m_StreamCount);
-    }
-
-    static uint32_t OpenGLGetVertexDeclarationStride(HVertexDeclaration vertex_declaration)
-    {
-        return vertex_declaration->m_Stride;
-    }
-
-    static uint32_t OpenGLGetVertexStreamOffset(HVertexDeclaration vertex_declaration, uint64_t name_hash)
-    {
-        uint32_t count = vertex_declaration->m_StreamCount;
-        VertexDeclaration::Stream* streams = vertex_declaration->m_Streams;
-        for (int i = 0; i < count; ++i)
-        {
-            if (streams[i].m_NameHash == name_hash)
-            {
-                return streams[i].m_Offset;
-            }
-        }
-        return dmGraphics::INVALID_STREAM_OFFSET;
     }
 
     static void OpenGLDrawElements(HContext context, PrimitiveType prim_type, uint32_t first, uint32_t count, Type type, HIndexBuffer index_buffer)
@@ -1760,6 +1746,11 @@ static void LogFrameBufferError(GLenum status)
         return (HFragmentProgram) CreateShader(GL_FRAGMENT_SHADER, ddf);
     }
 
+    static HComputeProgram OpenGLNewComputeProgram(HContext context, ShaderDesc::Shader* ddf)
+    {
+        return (HVertexProgram) CreateShader(DMGRAPHICS_TYPE_COMPUTE_SHADER, ddf);
+    }
+
     static void BuildAttributes(OpenGLProgram* program_ptr)
     {
         GLint num_attributes;
@@ -1798,23 +1789,62 @@ static void LogFrameBufferError(GLenum status)
         context->m_ModificationVersion = dmMath::Max(0U, context->m_ModificationVersion);
     }
 
-    static HComputeProgram OpenGLNewComputeProgram(HContext _context, ShaderDesc::Shader* ddf)
+    static bool LinkProgram(GLuint program)
     {
-        assert(0 && "Not implemented!");
-        return 0;
+        glLinkProgram(program);
+
+        GLint status;
+        glGetProgramiv(program, GL_LINK_STATUS, &status);
+
+        if (status == 0)
+        {
+            dmLogError("Unable to link program.");
+#ifndef NDEBUG
+            GLint logLength;
+            glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength);
+            if (logLength > 0)
+            {
+                GLchar *log = (GLchar*) malloc(logLength);
+                glGetProgramInfoLog(program, logLength, &logLength, log);
+                dmLogWarning("%s\n", log);
+                free(log);
+            }
+#endif
+            return false;
+        }
+        return true;
     }
 
     static HProgram OpenGLNewProgramFromCompute(HContext context, HComputeProgram compute_program)
     {
-        assert(0 && "Not implemented!");
-        return 0;
+        IncreaseModificationVersion((OpenGLContext*) context);
+
+        OpenGLComputeProgram* program = new OpenGLComputeProgram();
+
+        (void) context;
+        GLuint p = glCreateProgram();
+        CHECK_GL_ERROR;
+
+        OpenGLShader* compute_shader = (OpenGLShader*) compute_program;
+        GLuint compute_shader_id     = compute_shader->m_Id;
+
+        glAttachShader(p, compute_shader_id);
+        CHECK_GL_ERROR;
+
+        if (!LinkProgram(p))
+        {
+            delete program;
+            glDeleteProgram(p);
+            CHECK_GL_ERROR;
+            return 0;
+        }
+
+        program->m_Id       = p;
+        program->m_Language = compute_shader->m_Language;
+        return (HProgram) program;
     }
 
-    static void OpenGLDeleteComputeProgram(HComputeProgram prog)
-    {
-        assert(0 && "Not implemented!");
-    }
-
+    // TODO: Rename to graphicsprogram instead of newprogram
     static HProgram OpenGLNewProgram(HContext context, HVertexProgram vertex_program, HFragmentProgram fragment_program)
     {
         IncreaseModificationVersion((OpenGLContext*) context);
@@ -1848,26 +1878,9 @@ static void LogFrameBufferError(GLenum status)
         }
 #endif
 
-        glLinkProgram(p);
-
-        GLint status;
-        glGetProgramiv(p, GL_LINK_STATUS, &status);
-        if (status == 0)
+        if (!LinkProgram(p))
         {
-            dmLogError("Unable to link program.");
-#ifndef NDEBUG
-            GLint logLength;
-            glGetProgramiv(p, GL_INFO_LOG_LENGTH, &logLength);
-            if (logLength > 0)
-            {
-                GLchar *log = (GLchar *)malloc(logLength);
-                glGetProgramInfoLog(p, logLength, &logLength, log);
-                dmLogError("%s", log);
-                free(log);
-            }
-#endif
             delete program;
-
             glDeleteProgram(p);
             CHECK_GL_ERROR;
             return 0;
@@ -1977,12 +1990,17 @@ static void LogFrameBufferError(GLenum status)
 
     static void OpenGLDeleteVertexProgram(HVertexProgram program)
     {
-        OpenGLDeleteShader(((OpenGLShader*) program));
+        OpenGLDeleteShader((OpenGLShader*) program);
     }
 
     static void OpenGLDeleteFragmentProgram(HFragmentProgram program)
     {
-        OpenGLDeleteShader(((OpenGLShader*) program));
+        OpenGLDeleteShader((OpenGLShader*) program);
+    }
+
+    static void OpenGLDeleteComputeProgram(HComputeProgram program)
+    {
+        OpenGLDeleteShader((OpenGLShader*) program);
     }
 
     static ShaderDesc::Language OpenGLGetProgramLanguage(HProgram program)
@@ -1990,7 +2008,7 @@ static void LogFrameBufferError(GLenum status)
         return ((OpenGLProgram*) program)->m_Language;
     }
 
-    static ShaderDesc::Language OpenGLGetShaderProgramLanguage(HContext _context)
+    static ShaderDesc::Language OpenGLGetShaderProgramLanguage(HContext _context, ShaderDesc::ShaderClass shader_class)
     {
         OpenGLContext* context = (OpenGLContext*) _context;
         if (context->m_IsShaderLanguageGles) // 0 == glsl, 1 == gles
@@ -2047,7 +2065,7 @@ static void LogFrameBufferError(GLenum status)
         return success;
     }
 
-    static bool OpenGLReloadProgram(HContext context, HProgram program, HVertexProgram vert_program, HFragmentProgram frag_program)
+    static bool OpenGLReloadProgramGraphics(HContext context, HProgram program, HVertexProgram vert_program, HFragmentProgram frag_program)
     {
         if (!TryLinkProgram(vert_program, frag_program))
         {
@@ -2060,6 +2078,18 @@ static void LogFrameBufferError(GLenum status)
         CHECK_GL_ERROR;
 
         BuildAttributes(program_ptr);
+        return true;
+    }
+
+    static bool OpenGLReloadProgramCompute(HContext context, HProgram program, HComputeProgram compute_program)
+    {
+        assert(0);
+        return false;
+    }
+
+    static bool OpenGLReloadComputeProgram(HComputeProgram prog, ShaderDesc::Shader* ddf)
+    {
+        (void)prog;
         return true;
     }
 
@@ -2418,7 +2448,7 @@ static void LogFrameBufferError(GLenum status)
             dmLogWarning("Stencil textures are not supported on the OpenGL adapter, defaulting to render buffer.");
         }
 
-        if (use_depth_attachment && use_stencil_attachment)
+        if (use_depth_attachment && use_stencil_attachment && stencil_texture != depth_texture)
         {
             dmLogWarning("Creating a RenderTarget with different backing storage (depth: %s != stencil: %s), defaulting to the depth buffer type for both.",
                 (depth_texture ? "texture" : "buffer"),
@@ -2758,50 +2788,57 @@ static void LogFrameBufferError(GLenum status)
         return StoreAssetInContainer(context->m_AssetHandleContainer, tex, ASSET_TYPE_TEXTURE);
     }
 
-    static void OpenGLDoDeleteTexture(void* context)
+    static void DoDeleteTexture(OpenGLContext* context, HTexture texture)
     {
-        HTexture texture   = (HTexture) context;
-        OpenGLTexture* tex = GetAssetFromContainer<OpenGLTexture>(g_Context->m_AssetHandleContainer, texture);
+        OpenGLTexture* tex = GetAssetFromContainer<OpenGLTexture>(context->m_AssetHandleContainer, texture);
 
-        glDeleteTextures(tex->m_NumTextureIds, tex->m_TextureIds);
-        CHECK_GL_ERROR;
-        free(tex->m_TextureIds);
+        // Even if we check for validity when the texture was flagged for async deletion,
+        // we can still end up in this state in very specific cases.
+        if (tex != 0x0)
+        {
+            glDeleteTextures(tex->m_NumTextureIds, tex->m_TextureIds);
+            CHECK_GL_ERROR;
+            free(tex->m_TextureIds);
+        }
 
-        g_Context->m_AssetHandleContainer.Release(texture);
+        context->m_AssetHandleContainer.Release(texture);
         delete tex;
+    }
+
+    static int AsyncDeleteTextureProcess(void* _context, void* data)
+    {
+        OpenGLContext* context = (OpenGLContext*) _context;
+        DoDeleteTexture(context, (HTexture) data);
+        return 0;
     }
 
     static void OpenGLDeleteTextureAsync(HTexture texture)
     {
-        JobDesc j;
-        j.m_Context = (void*)texture;
-        j.m_Func = OpenGLDoDeleteTexture;
-        j.m_FuncComplete = 0;
-        JobQueuePush(j);
+        dmJobThread::PushJob(g_Context->m_JobThread, AsyncDeleteTextureProcess, 0, (void*) g_Context, (void*) texture);
     }
 
-    static void PostDeleteTextures(bool force_delete)
+    static void PostDeleteTextures(OpenGLContext* context, bool force_delete)
     {
         DM_PROFILE("OpenGLPostDeleteTextures");
 
         if (force_delete)
         {
-            uint32_t size = g_PostDeleteTexturesArray.Size();
+            uint32_t size = context->m_SetTextureAsyncState.m_PostDeleteTextures.Size();
             for (uint32_t i = 0; i < size; ++i)
             {
-                OpenGLDoDeleteTexture((void*)(size_t) g_PostDeleteTexturesArray[i]);
+                DoDeleteTexture(context, context->m_SetTextureAsyncState.m_PostDeleteTextures[i]);
             }
             return;
         }
 
         uint32_t i = 0;
-        while(i < g_PostDeleteTexturesArray.Size())
+        while(i < context->m_SetTextureAsyncState.m_PostDeleteTextures.Size())
         {
-            HTexture texture = g_PostDeleteTexturesArray[i];
+            HTexture texture = context->m_SetTextureAsyncState.m_PostDeleteTextures[i];
             if(!(dmGraphics::GetTextureStatusFlags(texture) & dmGraphics::TEXTURE_STATUS_DATA_PENDING))
             {
                 OpenGLDeleteTextureAsync(texture);
-                g_PostDeleteTexturesArray.EraseSwap(i);
+                context->m_SetTextureAsyncState.m_PostDeleteTextures.EraseSwap(i);
             }
             else
             {
@@ -2813,18 +2850,20 @@ static void LogFrameBufferError(GLenum status)
     static void OpenGLDeleteTexture(HTexture texture)
     {
         assert(texture);
+        // We can only delete valid textures
+        if (!IsAssetHandleValid(g_Context, texture))
+        {
+            return;
+        }
         // If they're not uploaded yet, we cannot delete them
         if(dmGraphics::GetTextureStatusFlags(texture) & dmGraphics::TEXTURE_STATUS_DATA_PENDING)
         {
-            if (g_PostDeleteTexturesArray.Full())
-            {
-                g_PostDeleteTexturesArray.OffsetCapacity(64);
-            }
-            g_PostDeleteTexturesArray.Push(texture);
-            return;
+            PushSetTextureAsyncDeleteTexture(g_Context->m_SetTextureAsyncState, texture);
         }
-
-        OpenGLDeleteTextureAsync(texture);
+        else
+        {
+            OpenGLDeleteTextureAsync(texture);
+        }
     }
 
     static GLenum GetOpenGLTextureWrap(TextureWrap wrap)
@@ -2859,27 +2898,49 @@ static void LogFrameBufferError(GLenum status)
         return texture_filter_lut[texture_filter];
     }
 
+    static inline GLenum GetNonMipMapVersionOfFilter(GLenum filter)
+    {
+        switch (filter)
+        {
+            case GL_NEAREST:
+            case GL_NEAREST_MIPMAP_NEAREST:
+            case GL_NEAREST_MIPMAP_LINEAR:
+                return GL_NEAREST;
+            default:
+                return GL_LINEAR;
+        }
+    }
+
+
     static void OpenGLSetTextureParams(HTexture texture, TextureFilter minfilter, TextureFilter magfilter, TextureWrap uwrap, TextureWrap vwrap, float max_anisotropy)
     {
         OpenGLTexture* tex = GetAssetFromContainer<OpenGLTexture>(g_Context->m_AssetHandleContainer, texture);
 
-        GLenum type = GetOpenGLTextureType(tex->m_Type);
+        GLenum gl_type       = GetOpenGLTextureType(tex->m_Type);
+        GLenum gl_min_filter = GetOpenGLTextureFilter(minfilter == TEXTURE_FILTER_DEFAULT ? g_Context->m_DefaultTextureMinFilter : minfilter);
+        GLenum gl_mag_filter = GetOpenGLTextureFilter(magfilter == TEXTURE_FILTER_DEFAULT ? g_Context->m_DefaultTextureMagFilter : magfilter);
 
-        glTexParameteri(type, GL_TEXTURE_MIN_FILTER, GetOpenGLTextureFilter(minfilter));
+        // Using a mipmapped min filter without any mipmaps will break the sampler
+        if (tex->m_MipMapCount <= 1)
+        {
+            gl_min_filter = GetNonMipMapVersionOfFilter(gl_min_filter);
+        }
+
+        glTexParameteri(gl_type, GL_TEXTURE_MIN_FILTER, gl_min_filter);
         CHECK_GL_ERROR;
 
-        glTexParameteri(type, GL_TEXTURE_MAG_FILTER, GetOpenGLTextureFilter(magfilter));
+        glTexParameteri(gl_type, GL_TEXTURE_MAG_FILTER, gl_mag_filter);
         CHECK_GL_ERROR;
 
-        glTexParameteri(type, GL_TEXTURE_WRAP_S, GetOpenGLTextureWrap(uwrap));
+        glTexParameteri(gl_type, GL_TEXTURE_WRAP_S, GetOpenGLTextureWrap(uwrap));
         CHECK_GL_ERROR
 
-        glTexParameteri(type, GL_TEXTURE_WRAP_T, GetOpenGLTextureWrap(vwrap));
+        glTexParameteri(gl_type, GL_TEXTURE_WRAP_T, GetOpenGLTextureWrap(vwrap));
         CHECK_GL_ERROR
 
         if (g_Context->m_AnisotropySupport && max_anisotropy > 1.0f)
         {
-            glTexParameterf(type, GL_TEXTURE_MAX_ANISOTROPY_EXT, dmMath::Min(max_anisotropy, g_Context->m_MaxAnisotropy));
+            glTexParameterf(gl_type, GL_TEXTURE_MAX_ANISOTROPY_EXT, dmMath::Min(max_anisotropy, g_Context->m_MaxAnisotropy));
             CHECK_GL_ERROR
         }
     }
@@ -2894,56 +2955,61 @@ static void LogFrameBufferError(GLenum status)
     static uint32_t OpenGLGetTextureStatusFlags(HTexture texture)
     {
         OpenGLTexture* tex = GetAssetFromContainer<OpenGLTexture>(g_Context->m_AssetHandleContainer, texture);
-        uint32_t flags = TEXTURE_STATUS_OK;
-        if(tex->m_DataState)
+        uint32_t flags     = TEXTURE_STATUS_OK;
+        if(tex && tex->m_DataState)
         {
             flags |= TEXTURE_STATUS_DATA_PENDING;
         }
         return flags;
     }
 
-    static void OpenGLDoSetTextureAsync(void* context)
+    // Called on worker thread
+    static int AsyncProcessCallback(void* _context, void* data)
     {
-        uint16_t param_array_index = (uint16_t) (size_t) context;
-        TextureParamsAsync ap;
-        {
-            dmMutex::ScopedLock lk(g_Context->m_AsyncMutex);
-            ap = g_TextureParamsAsyncArray[param_array_index];
-            g_TextureParamsAsyncArrayIndices.Push(param_array_index);
-        }
+        OpenGLContext* context     = (OpenGLContext*) _context;
+        uint16_t param_array_index = (uint16_t) (size_t) data;
+        SetTextureAsyncParams ap   = GetSetTextureAsyncParams(context->m_SetTextureAsyncState, param_array_index);
+
+        // TODO: If we use multiple workers, we either need more secondary contexts,
+        //       or we need to guard this call with a mutex.
+        //       The window handle (pointer) isn't protected by a mutex either,
+        //       but it is currently not used with our GLFW version (yet) so
+        //       we don't necessarily need to guard it right now.
         SetTexture(ap.m_Texture, ap.m_Params);
         glFlush();
 
-        OpenGLTexture* tex = GetAssetFromContainer<OpenGLTexture>(g_Context->m_AssetHandleContainer, ap.m_Texture);
-
+        OpenGLTexture* tex = GetAssetFromContainer<OpenGLTexture>(context->m_AssetHandleContainer, ap.m_Texture);
         tex->m_DataState &= ~(1<<ap.m_Params.m_MipMap);
+
+        return 0;
+    }
+
+    // Called on thread where we update (which should be the main thread)
+    static void AsyncCompleteCallback(void* _context, void* data, int result)
+    {
+        OpenGLContext* context     = (OpenGLContext*) _context;
+        uint16_t param_array_index = (uint16_t) (size_t) data;
+        ReturnSetTextureAsyncIndex(context->m_SetTextureAsyncState, param_array_index);
     }
 
     static void OpenGLSetTextureAsync(HTexture texture, const TextureParams& params)
     {
-        OpenGLTexture* tex = GetAssetFromContainer<OpenGLTexture>(g_Context->m_AssetHandleContainer, texture);
-
-        tex->m_DataState |= 1<<params.m_MipMap;
-        uint16_t param_array_index;
+        if (g_Context->m_AsyncProcessingSupport)
         {
-            dmMutex::ScopedLock lk(g_Context->m_AsyncMutex);
-            if (g_TextureParamsAsyncArrayIndices.Remaining() == 0)
-            {
-                g_TextureParamsAsyncArrayIndices.SetCapacity(g_TextureParamsAsyncArrayIndices.Capacity()+64);
-                g_TextureParamsAsyncArray.SetCapacity(g_TextureParamsAsyncArrayIndices.Capacity());
-                g_TextureParamsAsyncArray.SetSize(g_TextureParamsAsyncArray.Capacity());
-            }
-            param_array_index = g_TextureParamsAsyncArrayIndices.Pop();
-            TextureParamsAsync& ap = g_TextureParamsAsyncArray[param_array_index];
-            ap.m_Texture = texture;
-            ap.m_Params = params;
-        }
+            OpenGLTexture* tex         = GetAssetFromContainer<OpenGLTexture>(g_Context->m_AssetHandleContainer, texture);
+            tex->m_DataState          |= 1<<params.m_MipMap;
+            uint16_t param_array_index = PushSetTextureAsyncState(g_Context->m_SetTextureAsyncState, texture, params);
 
-        JobDesc j;
-        j.m_Context = (void*)(size_t)param_array_index;
-        j.m_Func = OpenGLDoSetTextureAsync;
-        j.m_FuncComplete = 0;
-        JobQueuePush(j);
+            dmJobThread::PushJob(g_Context->m_JobThread,
+                AsyncProcessCallback,
+                AsyncCompleteCallback,
+                (void*) g_Context,
+                (void*) (uintptr_t) param_array_index);
+        }
+        else
+        {
+            SetTexture(texture, params);
+        }
     }
 
     static HandleResult OpenGLGetTextureHandle(HTexture texture, void** out_handle)
@@ -3348,6 +3414,11 @@ static void LogFrameBufferError(GLenum status)
     static uint32_t OpenGLGetTextureResourceSize(HTexture texture)
     {
         OpenGLTexture* tex = GetAssetFromContainer<OpenGLTexture>(g_Context->m_AssetHandleContainer, texture);
+        if (!tex)
+        {
+            return 0;
+        }
+
         uint32_t size_total = 0;
         uint32_t size = tex->m_ResourceSize; // Size for mip 0
         for(uint32_t i = 0; i < tex->m_MipMapCount; ++i)
@@ -3397,6 +3468,7 @@ static void LogFrameBufferError(GLenum status)
     static void OpenGLEnableTexture(HContext _context, uint32_t unit, uint8_t id_index, HTexture texture)
     {
         OpenGLContext* context = (OpenGLContext*) _context;
+        assert(GetAssetType(texture) == ASSET_TYPE_TEXTURE);
         OpenGLTexture* tex = GetAssetFromContainer<OpenGLTexture>(context->m_AssetHandleContainer, texture);
         assert(id_index < tex->m_NumTextureIds);
 

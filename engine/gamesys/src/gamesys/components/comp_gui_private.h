@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -141,7 +141,7 @@ namespace dmGameSystem
         dmArray<BoxVertex>                       m_ClientVertexBuffer;
         dmGraphics::HTexture                     m_WhiteTexture;
         dmParticle::HParticleContext             m_ParticleContext;
-        dmParticle::ParticleVertexAttributeInfos m_ParticleAttributeInfos;
+        dmGraphics::VertexAttributeInfos         m_ParticleAttributeInfos;
         uint32_t                                 m_MaxParticleFXCount;
         uint32_t                                 m_MaxParticleCount;
         uint32_t                                 m_RenderedParticlesSize;

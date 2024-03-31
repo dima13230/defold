@@ -1,4 +1,4 @@
-;; Copyright 2020-2023 The Defold Foundation
+;; Copyright 2020-2024 The Defold Foundation
 ;; Copyright 2014-2020 King
 ;; Copyright 2009-2014 Ragnar Svensson, Christian Murray
 ;; Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -108,10 +108,10 @@
   (atom {}))
 
 ;; The same logic implemented in Project.java.
-;; If you change something here, plese change it there as well
+;; If you change something here, please change it there as well
 ;; Search for excluedFilesAndFoldersEntries.
 ;; root -> pred if project path (string starting with /) is ignored
-(defn- defignore-pred [^File root]
+(defn defignore-pred [^File root]
   (let [defignore-file (io/file root ".defignore")
         defignore-path (.getCanonicalPath defignore-file)
         latest-mtime (.lastModified defignore-file)
@@ -119,18 +119,25 @@
     (if (= mtime latest-mtime)
       pred
       (let [pred (if (.isFile defignore-file)
-                   (let [prefixes (into
-                                    #{}
-                                    (filter #(string/starts-with? % "/"))
-                                    (string/split-lines (slurp defignore-file)))]
+                   (let [prefixes (into []
+                                        (comp
+                                          (filter #(string/starts-with? % "/"))
+                                          (distinct))
+                                        (string/split-lines (slurp defignore-file)))]
                      (fn ignored-path? [path]
                        (boolean (some #(string/starts-with? path %) prefixes))))
                    (constantly false))]
         (swap! defignore-cache assoc defignore-path {:mtime latest-mtime :pred pred})
         pred))))
 
+(def ^:dynamic *defignore-pred* nil)
+
+(defmacro with-defignore-pred [root-expr & body]
+  `(binding [*defignore-pred* (defignore-pred ~root-expr)]
+     ~@body))
+
 (defn ignored-project-path? [^File root proj-path]
-  ((defignore-pred root) proj-path))
+  ((or *defignore-pred* (defignore-pred root)) proj-path))
 
 ;; Note! Used to keep a file here instead of path parts, but on
 ;; Windows (File. "test") equals (File. "Test") which broke
@@ -443,7 +450,7 @@
                 "design" ["atlas" "collection" "collisionobject" "cubemap" "dae"
                           "font" "go" "gui" "label" "model" "particlefx"
                           "spinemodel" "spinescene" "sprite" "tilemap"
-                          "tilesource"]
+                          "tilesource" "render_target"]
                 "property" ["animationset" "camera" "collectionfactory"
                             "collectionproxy" "display_profiles" "factory"
                             "gamepads" "input_binding" "material" "project"

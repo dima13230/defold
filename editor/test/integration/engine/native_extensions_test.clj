@@ -1,4 +1,4 @@
-;; Copyright 2020-2023 The Defold Foundation
+;; Copyright 2020-2024 The Defold Foundation
 ;; Copyright 2014-2020 King
 ;; Copyright 2009-2014 Ragnar Svensson, Christian Murray
 ;; Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -35,7 +35,7 @@
 
 (use-fixtures :once fix-engine-sha1)
 
-(deftest extension-roots-test
+(deftest ^:native-extensions extension-roots-test
   (with-clean-system
     (let [workspace (test-util/setup-workspace! world "test/resources/extension_project")
           project (test-util/setup-project! workspace)]
@@ -43,7 +43,7 @@
         (is (= #{"/extension1" "/subdir/extension2"}
                (set (map resource/proj-path (native-extensions/engine-extension-roots project evaluation-context)))))))))
 
-(deftest unpack-bin-zip-test
+(deftest ^:native-extensions unpack-bin-zip-test
   (testing "${ext}/plugins/${platform}.zip is extracted to /build/plugins/${ext}/plugins/ folder"
    (with-clean-system
      (let [workspace (test-util/setup-scratch-workspace! world "test/resources/extension_project")
@@ -61,7 +61,7 @@
        ;; The file is extracted to its place from zip:
        (is (.exists (io/file (str root (format "/build/plugins/ext_with_bin_zip/plugins/bin/%s/lsp.editor_script" (.getPair (Platform/getHostPlatform)))))))))))
 
-(deftest extension-resource-nodes-test
+(deftest ^:native-extensions extension-resource-nodes-test
   (letfn [(platform-resources [project platform]
             (let [resource-nodes (g/with-auto-evaluation-context evaluation-context
                                    (native-extensions/extension-resource-nodes project evaluation-context platform))]
@@ -102,32 +102,6 @@
 
 (defn- dummy-file [] (fs/create-temp-file! "dummy" ""))
 
-(deftest cached-engine-archive-test
-  (let [cache-dir (fs/create-temp-directory! "defold-test")]
-    (testing "nothing cached initially"
-      (is (nil? (#'native-extensions/cached-engine-archive cache-dir "x86_64-osx" "a")))
-      (is (nil? (#'native-extensions/cached-engine-archive cache-dir "x86_64-win32" "a"))))
-
-    (testing "caches platforms separately"
-      ;; cache a build for x86_64-osx with key a
-      (is (#'native-extensions/cache-engine-archive! cache-dir "x86_64-osx" "a" (dummy-file)))
-      (is (#'native-extensions/cached-engine-archive cache-dir "x86_64-osx" "a"))
-      (is (nil? (#'native-extensions/cached-engine-archive cache-dir "x86_64-win32" "a")))
-
-      ;; cache a build for x86_64-win32 with key a
-      (is (#'native-extensions/cache-engine-archive! cache-dir "x86_64-win32" "a" (dummy-file)))
-      (is (#'native-extensions/cached-engine-archive cache-dir "x86_64-win32" "a"))
-      (is (#'native-extensions/cached-engine-archive cache-dir "x86_64-osx" "a")))
-
-    (testing "verifies key"
-      ;; cache a build for x86_64-osx with key a
-      (is (#'native-extensions/cache-engine-archive! cache-dir "x86_64-osx" "a" (dummy-file)))
-      (is (nil? (#'native-extensions/cached-engine-archive cache-dir "x86_64-osx" "b")))
-
-      ;; cache anew with key b
-      (is (#'native-extensions/cache-engine-archive! cache-dir "x86_64-osx" "b" (dummy-file)))
-      (is (#'native-extensions/cached-engine-archive cache-dir "x86_64-osx" "b")))))
-
 (defn- blocking-async-build! [project prefs]
   (let [result (promise)]
     (test-util/run-event-loop!
@@ -139,7 +113,7 @@
                                             (exit-event-loop!)))))
     (deref result)))
 
-(deftest async-build-on-build-server
+(deftest ^:native-extensions async-build-on-build-server
   (with-clean-system
     (let [workspace (test-util/setup-scratch-workspace! world "test/resources/trivial_extension")
           project (test-util/setup-project! workspace)

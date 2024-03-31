@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -393,12 +393,29 @@ namespace dmEngine
     {
         if (strcmp(filter, "linear") == 0)
         {
-            return dmGraphics::TEXTURE_FILTER_LINEAR_MIPMAP_NEAREST;
+            return dmGraphics::TEXTURE_FILTER_LINEAR;
         }
-        else
+        else if (strcmp(filter, "nearest") == 0)
+        {
+            return dmGraphics::TEXTURE_FILTER_NEAREST;
+        }
+        else if (strcmp(filter, "nearest_mipmap_nearest") == 0)
         {
             return dmGraphics::TEXTURE_FILTER_NEAREST_MIPMAP_NEAREST;
         }
+        else if (strcmp(filter, "nearest_mipmap_linear") == 0)
+        {
+            return dmGraphics::TEXTURE_FILTER_NEAREST_MIPMAP_LINEAR;
+        }
+        else if (strcmp(filter, "linear_mipmap_nearest") == 0)
+        {
+            return dmGraphics::TEXTURE_FILTER_LINEAR_MIPMAP_NEAREST;
+        }
+        else if (strcmp(filter, "linear_mipmap_linear") == 0)
+        {
+            return dmGraphics::TEXTURE_FILTER_LINEAR_MIPMAP_LINEAR;
+        }
+        return (dmGraphics::TextureFilter) -1;
     }
 
     dmGraphics::TextureFilter ConvertMagTextureFilter(const char* filter)
@@ -751,11 +768,6 @@ namespace dmEngine
 #endif
         engine->m_HidContext = dmHID::NewContext(new_hid_params);
 
-        if (use_accelerometer)
-        {
-            dmHID::EnableAccelerometer(engine->m_HidContext); // Creates and enables the accelerometer
-        }
-
         dmEngine::ExtensionAppParams app_params;
         app_params.m_ConfigFile = engine->m_Config;
         app_params.m_WebServer = dmEngineService::GetWebServer(engine->m_EngineService);
@@ -857,6 +869,11 @@ namespace dmEngine
             return false;
         }
 
+        dmJobThread::JobThreadCreationParams job_thread_create_param;
+        job_thread_create_param.m_ThreadNames[0] = "DefoldJobThread1";
+        job_thread_create_param.m_ThreadCount    = 1;
+        engine->m_JobThreadContext               = dmJobThread::Create(job_thread_create_param);
+
         dmGraphics::ContextParams graphics_context_params;
         graphics_context_params.m_DefaultTextureMinFilter = ConvertMinTextureFilter(dmConfigFile::GetString(engine->m_Config, "graphics.default_texture_min_filter", "linear"));
         graphics_context_params.m_DefaultTextureMagFilter = ConvertMagTextureFilter(dmConfigFile::GetString(engine->m_Config, "graphics.default_texture_mag_filter", "linear"));
@@ -868,6 +885,7 @@ namespace dmEngine
         graphics_context_params.m_Width                   = engine->m_Width;
         graphics_context_params.m_Height                  = engine->m_Height;
         graphics_context_params.m_PrintDeviceInfo         = dmConfigFile::GetInt(engine->m_Config, "display.display_device_info", 0);
+        graphics_context_params.m_JobThread               = engine->m_JobThreadContext;
 
         engine->m_GraphicsContext = dmGraphics::NewContext(graphics_context_params);
         if (engine->m_GraphicsContext == 0x0)
@@ -1004,6 +1022,7 @@ namespace dmEngine
 #else
         render_params.m_MaxDebugVertexCount = 0;
 #endif
+        render_params.m_MaxBatches = (uint32_t) dmConfigFile::GetInt(engine->m_Config, "graphics.max_font_batches", 128);
         engine->m_RenderContext = dmRender::NewRenderContext(engine->m_GraphicsContext, render_params);
 
         dmGameObject::Initialize(engine->m_Register, engine->m_GOScriptContext);
@@ -1029,6 +1048,11 @@ namespace dmEngine
         // Any connected devices are registered here.
         dmHID::Init(engine->m_HidContext);
 
+        if (use_accelerometer)
+        {
+            dmHID::EnableAccelerometer(engine->m_HidContext); // Creates and enables the accelerometer
+        }
+
         dmMessage::Result mr = dmMessage::NewSocket(SYSTEM_SOCKET_NAME, &engine->m_SystemSocket);
         if (mr != dmMessage::RESULT_OK)
         {
@@ -1044,12 +1068,13 @@ namespace dmEngine
 
         dmGui::NewContextParams gui_params;
         gui_params.m_ScriptContext = engine->m_GuiScriptContext;
+        gui_params.m_HidContext = engine->m_HidContext;
         gui_params.m_GetURLCallback = dmGameSystem::GuiGetURLCallback;
         gui_params.m_GetUserDataCallback = dmGameSystem::GuiGetUserDataCallback;
         gui_params.m_ResolvePathCallback = dmGameSystem::GuiResolvePathCallback;
         gui_params.m_GetTextMetricsCallback = dmGameSystem::GuiGetTextMetricsCallback;
 
-      // If an extension changes window size at extensions initialization phase, engine should read that.
+        // If an extension changes window size at extensions initialization phase, engine should read that.
         physical_width = dmGraphics::GetWindowWidth(engine->m_GraphicsContext);
         physical_height = dmGraphics::GetWindowHeight(engine->m_GraphicsContext);
 
@@ -1280,15 +1305,19 @@ namespace dmEngine
         script_lib_context.m_Register        = engine->m_Register;
         script_lib_context.m_HidContext      = engine->m_HidContext;
         script_lib_context.m_GraphicsContext = engine->m_GraphicsContext;
+        script_lib_context.m_JobThread       = engine->m_JobThreadContext;
 
         if (engine->m_SharedScriptContext) {
+            script_lib_context.m_ScriptContext = engine->m_SharedScriptContext;
             script_lib_context.m_LuaState = dmScript::GetLuaState(engine->m_SharedScriptContext);
             if (!dmGameSystem::InitializeScriptLibs(script_lib_context))
                 goto bail;
         } else {
+            script_lib_context.m_ScriptContext = engine->m_GOScriptContext;
             script_lib_context.m_LuaState = dmScript::GetLuaState(engine->m_GOScriptContext);
             if (!dmGameSystem::InitializeScriptLibs(script_lib_context))
                 goto bail;
+            script_lib_context.m_ScriptContext = engine->m_GuiScriptContext;
             script_lib_context.m_LuaState = dmScript::GetLuaState(engine->m_GuiScriptContext);
             if (!dmGameSystem::InitializeScriptLibs(script_lib_context))
                 goto bail;
@@ -1530,20 +1559,39 @@ bail:
                         return;
                     }
                 }
+
+                dmJobThread::Update(engine->m_JobThreadContext);
+
                 {
                     DM_PROFILE("Script");
 
                     // Script context updates
-                    if (engine->m_SharedScriptContext) {
+                    dmGameSystem::ScriptLibContext script_lib_context;
+                    script_lib_context.m_Factory  = engine->m_Factory;
+                    script_lib_context.m_Register = engine->m_Register;
+
+                    if (engine->m_SharedScriptContext)
+                    {
+                        script_lib_context.m_LuaState = dmScript::GetLuaState(engine->m_SharedScriptContext);
+                        dmGameSystem::UpdateScriptLibs(script_lib_context);
                         dmScript::Update(engine->m_SharedScriptContext);
-                    } else {
-                        if (engine->m_GOScriptContext) {
+                    }
+                     else
+                     {
+                        if (engine->m_GOScriptContext)
+                        {
+                            script_lib_context.m_LuaState = dmScript::GetLuaState(engine->m_GOScriptContext);
+                            dmGameSystem::UpdateScriptLibs(script_lib_context);
                             dmScript::Update(engine->m_GOScriptContext);
                         }
-                        if (engine->m_RenderScriptContext) {
+                        if (engine->m_RenderScriptContext)
+                        {
                             dmScript::Update(engine->m_RenderScriptContext);
                         }
-                        if (engine->m_GuiScriptContext) {
+                        if (engine->m_GuiScriptContext)
+                        {
+                            script_lib_context.m_LuaState = dmScript::GetLuaState(engine->m_GuiScriptContext);
+                            dmGameSystem::UpdateScriptLibs(script_lib_context);
                             dmScript::Update(engine->m_GuiScriptContext);
                         }
                     }
@@ -1956,7 +2004,7 @@ bail:
     {
         dmResource::Result fact_error;
 #if !defined(DM_RELEASE)
-        const char* system_font_map = "/builtins/fonts/system_font.fontc";
+        const char* system_font_map = "/builtins/fonts/debug/always_on_top.fontc";
         fact_error = dmResource::Get(engine->m_Factory, system_font_map, (void**) &engine->m_SystemFontMap);
         if (fact_error != dmResource::RESULT_OK)
         {

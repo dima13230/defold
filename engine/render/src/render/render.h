@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -32,6 +32,14 @@ namespace dmRender
 
     static const uint32_t MAX_MATERIAL_TAG_COUNT = 32; // Max tag count per material
 
+    static const dmhash_t VERTEX_STREAM_POSITION   = dmHashString64("position");
+    static const dmhash_t VERTEX_STREAM_NORMAL     = dmHashString64("normal");
+    static const dmhash_t VERTEX_STREAM_TANGENT    = dmHashString64("tangent");
+    static const dmhash_t VERTEX_STREAM_COLOR      = dmHashString64("color");
+    static const dmhash_t VERTEX_STREAM_TEXCOORD0  = dmHashString64("texcoord0");
+    static const dmhash_t VERTEX_STREAM_TEXCOORD1  = dmHashString64("texcoord1");
+    static const dmhash_t VERTEX_STREAM_PAGE_INDEX = dmHashString64("page_index");
+
     typedef struct RenderTargetSetup*       HRenderTargetSetup;
     typedef uint64_t                        HRenderType;
     typedef uint64_t                        HSampler;
@@ -39,6 +47,8 @@ namespace dmRender
     typedef struct RenderScriptInstance*    HRenderScriptInstance;
     typedef struct Predicate*               HPredicate;
     typedef struct ComputeProgram*          HComputeProgram;
+    typedef uintptr_t                       HRenderBuffer;
+    typedef struct BufferedRenderBuffer*    HBufferedRenderBuffer;
 
     /**
      * Display profiles handle
@@ -50,6 +60,19 @@ namespace dmRender
         RENDER_SCRIPT_RESULT_FAILED = -1,
         RENDER_SCRIPT_RESULT_NO_FUNCTION = 0,
         RENDER_SCRIPT_RESULT_OK = 1
+    };
+
+    enum RenderResourceType
+    {
+        RENDER_RESOURCE_TYPE_INVALID       = 0,
+        RENDER_RESOURCE_TYPE_MATERIAL      = 1,
+        RENDER_RESOURCE_TYPE_RENDER_TARGET = 2,
+    };
+
+    enum RenderBufferType
+    {
+        RENDER_BUFFER_TYPE_VERTEX_BUFFER = 0,
+        RENDER_BUFFER_TYPE_INDEX_BUFFER  = 1,
     };
 
     enum TextAlign
@@ -105,6 +128,7 @@ namespace dmRender
         uint32_t                        m_VertexShaderDescSize;
         uint32_t                        m_FragmentShaderDescSize;
         uint32_t                        m_MaxCharacters;
+        uint32_t                        m_MaxBatches;
         uint32_t                        m_CommandBufferSize;
         /// Max debug vertex count
         /// NOTE: This is per debug-type and not the total sum
@@ -191,8 +215,10 @@ namespace dmRender
     HRenderScriptInstance   NewRenderScriptInstance(HRenderContext render_context, HRenderScript render_script);
     void                    DeleteRenderScriptInstance(HRenderScriptInstance render_script_instance);
     void                    SetRenderScriptInstanceRenderScript(HRenderScriptInstance render_script_instance, HRenderScript render_script);
-    void                    AddRenderScriptInstanceMaterial(HRenderScriptInstance render_script_instance, const char* material_name, dmRender::HMaterial material);
-    void                    ClearRenderScriptInstanceMaterials(HRenderScriptInstance render_script_instance);
+
+    void                    AddRenderScriptInstanceRenderResource(HRenderScriptInstance render_script_instance, const char* name, uint64_t resource, RenderResourceType type);
+    void                    ClearRenderScriptInstanceRenderResources(HRenderScriptInstance render_script_instance);
+
     RenderScriptResult      InitRenderScriptInstance(HRenderScriptInstance render_script_instance);
     RenderScriptResult      DispatchRenderScriptInstance(HRenderScriptInstance render_script_instance);
     RenderScriptResult      UpdateRenderScriptInstance(HRenderScriptInstance render_script_instance, float dt);
@@ -202,6 +228,7 @@ namespace dmRender
     HMaterial                       NewMaterial(dmRender::HRenderContext render_context, dmGraphics::HVertexProgram vertex_program, dmGraphics::HFragmentProgram fragment_program);
     void                            DeleteMaterial(dmRender::HRenderContext render_context, HMaterial material);
     HSampler                        GetMaterialSampler(HMaterial material, uint32_t unit);
+    dmhash_t                        GetMaterialSamplerNameHash(HMaterial material, uint32_t unit);
     uint32_t                        GetMaterialSamplerUnit(HMaterial material, dmhash_t name_hash);
     void                            ApplyMaterialConstants(dmRender::HRenderContext render_context, HMaterial material, const RenderObject* ro);
     void                            ApplyMaterialSampler(dmRender::HRenderContext render_context, HMaterial material, HSampler sampler, uint8_t value_index, dmGraphics::HTexture texture);
@@ -212,10 +239,29 @@ namespace dmRender
     void                            SetMaterialProgramConstantType(HMaterial material, dmhash_t name_hash, dmRenderDDF::MaterialDesc::ConstantType type);
     bool                            GetMaterialProgramConstant(HMaterial, dmhash_t name_hash, HConstant& out_value);
 
+    struct MaterialProgramAttributeInfo
+    {
+        dmhash_t                           m_AttributeNameHash;
+        const dmGraphics::VertexAttribute* m_Attribute;
+        const uint8_t*                     m_ValuePtr;
+        dmhash_t                           m_ElementIds[4];
+        uint32_t                           m_ElementIndex;
+    };
+
     dmGraphics::HVertexDeclaration  GetVertexDeclaration(HMaterial material);
+    bool                            GetMaterialProgramAttributeInfo(HMaterial material, dmhash_t name_hash, MaterialProgramAttributeInfo& info);
     void                            GetMaterialProgramAttributes(HMaterial material, const dmGraphics::VertexAttribute** attributes, uint32_t* attribute_count);
     void                            GetMaterialProgramAttributeValues(HMaterial material, uint32_t index, const uint8_t** value_ptr, uint32_t* num_values);
     void                            SetMaterialProgramAttributes(HMaterial material, const dmGraphics::VertexAttribute* attributes, uint32_t attributes_count);
+
+    // Compute
+    HComputeProgram                 NewComputeProgram(HRenderContext render_context, dmGraphics::HComputeProgram shader);
+    void                            DeleteComputeProgram(dmRender::HRenderContext render_context, HComputeProgram program);
+    HRenderContext                  GetProgramRenderContext(HComputeProgram program);
+    dmGraphics::HComputeProgram     GetComputeProgramShader(HComputeProgram program);
+    dmGraphics::HProgram            GetComputeProgram(HComputeProgram program);
+    uint64_t                        GetProgramUserData(HComputeProgram program);
+    void                            SetProgramUserData(HComputeProgram program, uint64_t user_data);
 
     /** Retrieve info about a hash related to a program constant
      * The function checks if the hash matches a constant or any element of it.
@@ -249,6 +295,38 @@ namespace dmRender
     HPredicate                      NewPredicate();
     void                            DeletePredicate(HPredicate predicate);
     Result                          AddPredicateTag(HPredicate predicate, dmhash_t tag);
+
+    /** Buffered render buffers
+     * A render buffer is a thin wrapper around vertex and index buffers that, depending on graphics context,
+     * can allocate more backing storage if needed. E.g for Vulkan and vendor adapters, we cannot reuse the same
+     * vertex buffer during one scene since we will rewrite the data from the previous draw call during the frame.
+     *
+     * A typical usage scenario will look like this:
+     * // During a frame
+     * HRenderBuffer draw_call_1 = AddRenderBuffer(ctx, buffer);
+     * HRenderBuffer draw_call_2 = AddRenderBuffer(ctx, buffer);
+     * ...
+     *
+     * // After all draw calls have been submitted
+     * TrimBuffer(ctx, buffer);
+     * RewindBuffer(ctx, buffer);
+     *
+     * Note on trimming and rewind:
+     * Trimming the buffer means that we will resize the buffer count to
+     * however many internal render buffers were used since last Rewind call.
+     * This can be used to reduce the amount of unused buffers between consecutive calls,
+     * as well as to avoid excessive buffer allocations between frames.
+     * Rewinding the buffer means that we set the buffer index to the head of the buffer list,
+     * to prepare for setting data to the beginning of the buffer list again.
+     */
+    HBufferedRenderBuffer           NewBufferedRenderBuffer(HRenderContext render_context, RenderBufferType type);
+    void                            DeleteBufferedRenderBuffer(HRenderContext render_context, HBufferedRenderBuffer buffer);
+    HRenderBuffer                   AddRenderBuffer(HRenderContext render_context, HBufferedRenderBuffer buffer);
+    HRenderBuffer                   GetBuffer(HRenderContext render_context, HBufferedRenderBuffer buffer);
+    int32_t                         GetBufferIndex(HRenderContext render_context, HBufferedRenderBuffer buffer);
+    void                            SetBufferData(HRenderContext render_context, HBufferedRenderBuffer buffer, uint32_t size, void* data, dmGraphics::BufferUsage buffer_usage);
+    void                            TrimBuffer(HRenderContext render_context, HBufferedRenderBuffer buffer);
+    void                            RewindBuffer(HRenderContext render_context, HBufferedRenderBuffer buffer);
 
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -19,7 +19,6 @@ import org.apache.commons.io.FilenameUtils;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashSet;
-import java.util.Map;
 import java.util.Set;
 
 import com.dynamo.bob.Bob;
@@ -104,12 +103,19 @@ public class MaterialBuilder extends Builder<Void>  {
         }
         ShaderDesc.Shader spirvFragment = getSpirvShader(fragmentBuildContext.desc);
 
-
         for (ShaderDesc.ResourceBinding input : spirvFragment.getInputsList()) {
             boolean input_found = false;
             for (ShaderDesc.ResourceBinding output : spirvVertex.getOutputsList()) {
                 if (output.getNameHash() == input.getNameHash()) {
                     input_found = true;
+
+                    if (input.getBinding() != output.getBinding()) {
+                        throw new CompileExceptionError(
+                            String.format("Location mismatch for fragment shader input '%s': The vertex shader specifies the input at location %d, and location %d in the fragment shader.",
+                            input.getName(),
+                            output.getBinding(),
+                            input.getBinding()));
+                    }
                     break;
                 }
             }

@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -21,8 +21,7 @@
 #include <stdlib.h>
 #include <dlib/log.h>
 #include <dlib/time.h>
-
-#include "../job_thread.h"
+#include <dlib/job_thread.h>
 
 static volatile bool g_TestAsyncCallbackComplete = false;
 
@@ -35,7 +34,10 @@ class AsyncTestSingleThread : public jc_test_base_class
 public:
     virtual void SetUp()
     {
-        m_JobThread = dmJobThread::Create("test_jobs");
+        dmJobThread::JobThreadCreationParams job_thread_create_param;
+        job_thread_create_param.m_ThreadNames[0] = "test_jobs";
+        job_thread_create_param.m_ThreadCount    = 1;
+        m_JobThread = dmJobThread::Create(job_thread_create_param);
     }
     virtual void TearDown()
     {

@@ -1,4 +1,4 @@
-;; Copyright 2020-2023 The Defold Foundation
+;; Copyright 2020-2024 The Defold Foundation
 ;; Copyright 2014-2020 King
 ;; Copyright 2009-2014 Ragnar Svensson, Christian Murray
 ;; Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -28,7 +28,8 @@
             [editor.resource :as resource]
             [editor.resource-watch :as resource-watch]
             [editor.ui :as ui]
-            [editor.workspace :as workspace])
+            [editor.workspace :as workspace]
+            [util.coll :refer [pair]])
   (:import [com.defold.control TreeCell]
            [editor.resource FileResource]
            [java.io File]
@@ -106,6 +107,10 @@
    {:label "New"
     :command :new-file
     :expand? true
+    :icon "icons/64/Icons_29-AT-Unknown.png"}
+   {:label "New File"
+    :command :new-file
+    :user-data {:any-file true}
     :icon "icons/64/Icons_29-AT-Unknown.png"}
    {:label "New Folder"
     :command :new-folder
@@ -353,32 +358,55 @@
               [f dest-file]))
           files)))
 
-(defn rename [resource ^String new-name]
-  (assert (and new-name (not (string/blank? new-name))))
-  (let [workspace (resource/workspace resource)
-        src-file (io/file resource)
-        dest-file (File. (.getParent src-file) new-name)
-        project-directory-file (workspace/project-path workspace)
-        dest-proj-path (resource/file->proj-path project-directory-file dest-file)]
-    (when-not (resource-watch/reserved-proj-path? project-directory-file dest-proj-path)
-      (let [[[^File src-file ^File dest-file]]
-            ;; plain case change causes irrelevant conflict on case insensitive fs
-            ;; fs/move handles this, no need to resolve
-            (if (fs/same-file? src-file dest-file)
-              [[src-file dest-file]]
-              (resolve-any-conflicts [[src-file dest-file]]))]
-        (when dest-file
-          (let [src-files (doall (file-seq src-file))]
-            (fs/move! src-file dest-file)
-            (workspace/resource-sync! workspace (moved-files src-file dest-file src-files))))))))
-
 (defn rename? [resources]
   (and (disk-availability/available?)
-       (= 1 (count resources))
-       (let [resource (first resources)]
-         (and (resource/editable? resource)
-              (not (resource/read-only? resource))
-              (not (fixed-resource-paths (resource/resource->proj-path resource)))))))
+       (pos? (count resources))
+       (every? (fn [resource]
+                 (and (resource/editable? resource)
+                      (not (resource/read-only? resource))
+                      (not (fixed-resource-paths (resource/resource->proj-path resource)))))
+               resources)
+       (case (into #{} (map resource/source-type) resources)
+         #{:folder} (= 1 (count resources))
+         #{:file} (and
+                    (= 1 (count (into #{} (map resource/base-name) resources)))
+                    (= (count resources) (count (into #{} (map resource/ext) resources))))
+         false)))
+
+(defn rename [resources new-base-name]
+  {:pre [(string? new-base-name) (rename? resources)]}
+  (let [workspace (resource/workspace (first resources))
+        project-directory-file (workspace/project-path workspace)
+        dir (= :folder (resource/source-type (first resources)))
+        rename-pairs (mapv
+                       (fn [resource]
+                         (let [resource-file (io/file resource)
+                               parent (.getParent resource-file)
+                               ext (resource/ext resource)]
+                           (pair resource-file
+                                 (io/file parent (cond-> new-base-name
+                                                         (and (not dir) (seq ext))
+                                                         (str "." ext))))))
+                       resources)]
+    (when-not (some #(resource-watch/reserved-proj-path?
+                       project-directory-file
+                       (resource/file->proj-path project-directory-file (val %)))
+                    rename-pairs)
+      ;; plain case change causes irrelevant conflict on case-insensitive file systems
+      ;; fs/move! handles this, no need to resolve
+      (let [{case-changes true possible-conflicts false}
+            (group-by #(fs/same-file? (key %) (val %)) rename-pairs)]
+        (when-let [resolved-conflicts (resolve-any-conflicts possible-conflicts)]
+          (let [resolved-rename-pairs (into resolved-conflicts case-changes)]
+            (when (seq resolved-rename-pairs)
+              (workspace/resource-sync!
+                workspace
+                (into []
+                      (mapcat (fn [[src-file dst-file]]
+                                (let [src-files (vec (file-seq src-file))]
+                                  (fs/move! src-file dst-file)
+                                  (moved-files src-file dst-file src-files))))
+                      resolved-rename-pairs)))))))))
 
 (defn validate-new-resource-name [^File project-directory-file parent-path new-name]
   (let [prospect-path (str parent-path "/" new-name)]
@@ -388,25 +416,25 @@
 (handler/defhandler :rename :asset-browser
   (enabled? [selection] (rename? selection))
   (run [selection workspace]
-    (let [resource (first selection)
-          dir? (= :folder (resource/source-type resource))
-          extension (resource/ext resource)
-          name (if dir?
-                 (resource/resource-name resource)
-                 (if (seq extension)
-                   (string/replace (resource/resource-name resource)
-                                   (re-pattern (str "\\." extension "$"))
-                                   "")
-                   (resource/resource-name resource)))
-          parent-path (resource/parent-proj-path (resource/proj-path resource))
-          project-directory-file (workspace/project-path workspace)
-          options {:title (if dir? "Rename Folder" "Rename File")
-                   :label (if dir? "New Folder Name" "New File Name")
-                   :sanitize (if dir? dialogs/sanitize-folder-name (partial dialogs/sanitize-file-name extension))
-                   :validate (partial validate-new-resource-name project-directory-file parent-path)}
-          new-name (dialogs/make-rename-dialog name options)]
-      (when-let [sane-new-name (some-> new-name not-empty)]
-        (rename resource sane-new-name)))))
+    (let [first-resource (first selection)
+          dir (= :folder (resource/source-type first-resource))
+          name (if dir
+                 (resource/resource-name first-resource)
+                 (resource/base-name first-resource))
+          extensions (if dir [""] (mapv resource/ext selection))
+          parent-paths (mapv (comp resource/parent-proj-path resource/proj-path) selection)
+          project-directory-file (workspace/project-path workspace)]
+      (when-let [new-name (dialogs/make-rename-dialog
+                            name
+                            :title (cond
+                                     dir "Rename Folder"
+                                     (= 1 (count selection)) "Rename File"
+                                     :else "Rename Files")
+                            :label (if dir "New Folder Name" "New File Name")
+                            :extensions extensions
+                            :validate (fn [file-name]
+                                        (some #(validate-new-resource-name project-directory-file % file-name) parent-paths)))]
+        (rename selection new-name)))))
 
 (handler/defhandler :delete :asset-browser
   (enabled? [selection] (delete? selection))
@@ -430,10 +458,11 @@
                 {:title "Delete Files?"
                  :icon :icon/circle-question
                  :header "Are you sure you want to delete these files?"
-                 :content {:text (str "You are about to delete:\n" (->> selection
-                                                    (map #(str "\u00A0\u00A0\u2022\u00A0"
-                                                              (resource/resource-name %)))
-                                                    (string/join "\n")))}
+                 :content {:text (str "You are about to delete:\n"
+                                      (->> selection
+                                           (map #(str "\u00A0\u00A0\u2022\u00A0"
+                                                      (resource/resource-name %)))
+                                           (string/join "\n")))}
                  :buttons [{:text "Cancel"
                             :cancel-button true
                             :default-button true
@@ -465,35 +494,49 @@
                                                                                             resource/abs-path)))))
   (enabled? [] (disk-availability/available?))
   (run [selection user-data asset-browser app-view prefs workspace project]
-       (let [project-path (workspace/project-path workspace)
-             base-folder (-> (or (some-> (handler/adapt-every selection resource/Resource)
-                                   first
-                                   resource/abs-path
-                                   (File.))
-                                 project-path)
-                             fs/to-folder)
-             rt (:resource-type user-data)]
-         (when-let [desired-file (dialogs/make-new-file-dialog project-path base-folder (or (:label rt) (:ext rt)) (:ext rt))]
-           (when-let [[[_ new-file]] (resolve-any-conflicts [[nil desired-file]])]
-             (let [template (workspace/template workspace rt)]
-               (create-template-file! template new-file))
-             (workspace/resource-sync! workspace)
-             (let [resource-map (g/node-value workspace :resource-map)
-                   new-resource-path (resource/file->proj-path project-path new-file)
-                   resource (resource-map new-resource-path)]
-               (app-view/open-resource app-view prefs workspace project resource)
-               (select-resource! asset-browser resource))))))
+    (let [project-path (workspace/project-path workspace)
+          base-folder (-> (or (some-> (handler/adapt-every selection resource/Resource)
+                                first
+                                resource/abs-path
+                                (File.))
+                              project-path)
+                          fs/to-folder)
+          rt (:resource-type user-data)
+          any-file (:any-file user-data false)]
+      (when-let [desired-file (dialogs/make-new-file-dialog
+                                project-path
+                                base-folder
+                                (when-not any-file
+                                  (or (:label rt) (:ext rt)))
+                                (:ext rt))]
+        (when-let [[[_ ^File new-file]] (resolve-any-conflicts [[nil desired-file]])]
+          (let [rt (if (and any-file (not rt))
+                     (when-let [ext (second (re-find #"\.(.+)$" (.getName new-file)))]
+                       (workspace/get-resource-type workspace ext))
+                     rt)
+                template (or (workspace/template workspace rt) "")]
+            (create-template-file! template new-file))
+          (workspace/resource-sync! workspace)
+          (let [resource-map (g/node-value workspace :resource-map)
+                new-resource-path (resource/file->proj-path project-path new-file)
+                resource (resource-map new-resource-path)]
+            (app-view/open-resource app-view prefs workspace project resource)
+            (select-resource! asset-browser resource))))))
   (options [workspace selection user-data]
-           (when (not user-data)
-             (sort-by (comp string/lower-case :label)
-                      (keep (fn [[_ext resource-type]]
-                              (when (workspace/has-template? workspace resource-type)
-                                {:label (or (:label resource-type) (:ext resource-type))
-                                 :icon (:icon resource-type)
-                                 :style (resource/ext-style-classes (:ext resource-type))
-                                 :command :new-file
-                                 :user-data {:resource-type resource-type}}))
-                            (workspace/get-resource-type-map workspace))))))
+    (when (not user-data)
+      (sort-by (comp string/lower-case :label)
+               (into [{:label "File"
+                       :icon "icons/64/Icons_29-AT-Unknown.png"
+                       :command :new-file
+                       :user-data {:any-file true}}]
+                     (keep (fn [[_ext resource-type]]
+                             (when (workspace/has-template? workspace resource-type)
+                               {:label (or (:label resource-type) (:ext resource-type))
+                                :icon (:icon resource-type)
+                                :style (resource/ext-style-classes (:ext resource-type))
+                                :command :new-file
+                                :user-data {:resource-type resource-type}})))
+                     (workspace/get-resource-type-map workspace))))))
 
 (defn- resolve-sub-folder [^File base-folder ^String new-folder-name]
   (.toFile (.resolve (.toPath base-folder) new-folder-name)))

@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -26,6 +26,11 @@
 
 #include <ddf/ddf.h>
 #include <rig/rig_ddf.h>
+
+namespace dmGraphics
+{
+    struct VertexAttributeInfos;
+}
 
 namespace dmRig
 {
@@ -168,6 +173,8 @@ namespace dmRig
     dmhash_t GetAnimation(HRigInstance instance);
 
     // Returns the new position in the array
+    uint8_t* GenerateVertexDataFromAttributes(dmRig::HRigContext context, dmRig::HRigInstance instance, dmRigDDF::Mesh* mesh, const dmVMath::Matrix4& world_matrix, const dmGraphics::VertexAttributeInfos* attribute_infos, uint32_t vertex_stride, uint8_t* vertex_data_out);
+    uint8_t* WriteSingleVertexDataByAttributes(uint8_t* write_ptr, uint32_t idx, const dmGraphics::VertexAttributeInfos* attribute_infos, const float* position, const float* normal, const float* tangent, const float* uv0, const float* uv1, const float* color);
     RigModelVertex* GenerateVertexData(HRigContext context, dmRig::HRigInstance instance, dmRigDDF::Mesh* mesh, const dmVMath::Matrix4& world_matrix, RigModelVertex* vertex_data_out);
     uint32_t GetVertexCount(HRigInstance instance);
 

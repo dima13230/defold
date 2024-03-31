@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -86,6 +86,13 @@ namespace dmGraphics
     typedef uintptr_t HIndexBuffer;
 
     /*#
+     * Storage buffer handle
+     * @typedef
+     * @name HStorageBuffer
+     */
+    typedef uintptr_t HStorageBuffer;
+
+    /*#
      * Uniform location handle
      * @typedef
      * @name HUniformLocation
@@ -107,11 +114,25 @@ namespace dmGraphics
     typedef struct VertexStreamDeclaration* HVertexStreamDeclaration;
 
     /*#
+     * PipelineState handle
+     * @typedef
+     * @name HPipelineState
+     */
+    typedef struct PipelineState* HPipelineState;
+
+    /*#
      * Invalid stream offset
      * @constant
      * @name INVALID_STREAM_OFFSET
      */
     const uint32_t INVALID_STREAM_OFFSET = 0xFFFFFFFF;
+
+    /*#
+     * Max buffer color attachments
+     * @constant
+     * @name MAX_BUFFER_COLOR_ATTACHMENTS
+     */
+    const uint8_t  MAX_BUFFER_COLOR_ATTACHMENTS = 4;
 
     /*#
      * @enum
@@ -141,6 +162,22 @@ namespace dmGraphics
         ATTACHMENT_DEPTH     = 1,
         ATTACHMENT_STENCIL   = 2,
         MAX_ATTACHMENT_COUNT = 3
+    };
+
+    /*#
+     * @enum
+     * @name AttachmentOp
+     * @member ATTACHMENT_OP_DONT_CARE
+     * @member ATTACHMENT_OP_LOAD
+     * @member ATTACHMENT_OP_STORE
+     * @member ATTACHMENT_OP_CLEAR
+     */
+    enum AttachmentOp
+    {
+        ATTACHMENT_OP_DONT_CARE,
+        ATTACHMENT_OP_LOAD,
+        ATTACHMENT_OP_STORE,
+        ATTACHMENT_OP_CLEAR,
     };
 
     /*#
@@ -377,6 +414,7 @@ namespace dmGraphics
      * @member TYPE_FLOAT_VEC3
      * @member TYPE_FLOAT_MAT2
      * @member TYPE_FLOAT_MAT3
+     * @member TYPE_IMAGE_2D
      */
     enum Type
     {
@@ -396,6 +434,7 @@ namespace dmGraphics
         TYPE_FLOAT_VEC3       = 13,
         TYPE_FLOAT_MAT2       = 14,
         TYPE_FLOAT_MAT3       = 15,
+        TYPE_IMAGE_2D         = 16,
     };
 
     /*#
@@ -435,6 +474,19 @@ namespace dmGraphics
         BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR = 12,
         BLEND_FACTOR_CONSTANT_ALPHA           = 13,
         BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA = 14,
+    };
+
+    /*#
+     * Vertex step function. Dictates how the data for a vertex attribute should be read in a vertex shader.
+     * @enum
+     * @name VertexStepFunction
+     * @member VERTEX_STEP_FUNCTION_VERTEX
+     * @member VERTEX_STEP_FUNCTION_INSTANCE
+     */
+    enum VertexStepFunction
+    {
+        VERTEX_STEP_FUNCTION_VERTEX,
+        VERTEX_STEP_FUNCTION_INSTANCE,
     };
 
     /*#

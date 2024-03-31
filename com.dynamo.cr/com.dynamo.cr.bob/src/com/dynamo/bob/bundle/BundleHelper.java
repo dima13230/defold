@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -22,15 +22,10 @@ import java.io.InputStream;
 import java.io.StringWriter;
 import java.net.URL;
 import java.net.ConnectException;
-import java.nio.file.FileSystem;
-import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.text.ParseException;
 import java.util.Arrays;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,17 +35,16 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
+
+import com.sun.istack.Nullable;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.io.filefilter.DirectoryFileFilter;
-import org.apache.commons.io.filefilter.RegexFileFilter;
 import org.apache.http.NoHttpResponseException;
 
 import com.defold.extender.client.ExtenderClient;
 import com.defold.extender.client.ExtenderClientException;
 import com.defold.extender.client.ExtenderResource;
-import com.dynamo.bob.Bob;
 import com.dynamo.bob.CompileExceptionError;
 import com.dynamo.bob.MultipleCompileException;
 import com.dynamo.bob.MultipleCompileException.Info;
@@ -60,8 +54,7 @@ import com.dynamo.bob.fs.IResource;
 import com.dynamo.bob.pipeline.ExtenderUtil;
 import com.dynamo.bob.pipeline.ExtenderUtil.FileExtenderResource;
 import com.dynamo.bob.util.BobProjectProperties;
-import com.dynamo.bob.util.Exec;
-import com.dynamo.bob.util.Exec.Result;
+import com.dynamo.bob.util.FileUtil;
 import com.samskivert.mustache.Mustache;
 import com.samskivert.mustache.MustacheException;
 import com.samskivert.mustache.Template;
@@ -77,12 +70,14 @@ public class BundleHelper {
     private Project project;
     private Platform platform;
     private BobProjectProperties projectProperties;
-    private IBundler bundler;
+    private IBundler platformBundler;
     private String title;
     private File buildDir;
     private File appDir;
     private String variant;
     private Map<String, Map<String, Object>> propertiesMap;
+
+    private Map<String, Object> templateProperties = new HashMap<>();
 
     public static final String SSL_CERTIFICATES_NAME   = "ssl_keys.pem";
     private static final String[] ARCHIVE_FILE_NAMES = {
@@ -99,10 +94,17 @@ public class BundleHelper {
         }
     }
 
-    public BundleHelper(Project project, Platform platform, File bundleDir, String variant) throws CompileExceptionError {
+    private IBundler getOrCreateBundler() throws CompileExceptionError {
+        if (this.platformBundler == null) {
+            this.platformBundler = this.project.createBundler(this.platform);
+        }
+        return this.platformBundler;
+    }
+
+    public BundleHelper(Project project, Platform platform, File bundleDir, String variant, @Nullable IBundler bundler) throws CompileExceptionError {
         this.projectProperties = project.getProjectProperties();
         this.propertiesMap = this.projectProperties.createTypedMap(new BobProjectProperties.PropertyType[]{BobProjectProperties.PropertyType.BOOL});
-        this.bundler = project.createBundler(platform);
+        this.platformBundler = bundler;
 
         this.project = project;
         this.platform = platform;
@@ -151,7 +153,9 @@ public class BundleHelper {
     }
 
     static public String formatResource(Map<String, Map<String, Object>> propertiesMap, Map<String, Object> properties, IResource resource) throws IOException {
-        byte[] data = resource.getContent();
+        return formatResource(propertiesMap, properties, resource.getContent(), resource.getPath());
+    }
+    static public String formatResource(Map<String, Map<String, Object>> propertiesMap, Map<String, Object> properties, byte[] data, final String sourceLocation) throws IOException {
         if (data == null) {
             return "";
         }
@@ -164,30 +168,23 @@ public class BundleHelper {
             MustacheException.Context context = (MustacheException.Context) e;
             String key = context.key;
             int lineNo = context.lineNo;
-            String path = resource.getPath();
-            String cause = String.format("File '%s' requires '%s' in line %d. Make sure you have '%s' in your game.project", path, key, lineNo, key);
+            String cause = String.format("File '%s' requires '%s' in line %d. Make sure you have '%s' in your game.project", sourceLocation, key, lineNo, key);
             throw new MustacheException(cause);
          }
         sw.flush();
         return sw.toString();
     }
 
-    private String formatResource(Map<String, Object> properties, IResource resource) throws IOException {
-        return formatResource(this.propertiesMap, properties, resource);
+    private String formatResource(byte[] content, final String sourceLocation) throws IOException {
+        return formatResource(this.propertiesMap, this.templateProperties, content, sourceLocation);
     }
 
-    private void formatResourceToFile(Map<String, Object> properties, IResource resource, File toFile) throws IOException {
-        FileUtils.write(toFile, formatResource(properties, resource));
+    private void formatResourceToFile(IResource resource, File toFile) throws IOException {
+        formatResourceToFile(resource.getContent(), resource.getPath(),toFile);
     }
 
-    static public void writeResourceToFile(IResource resource, File out) throws IOException {
-        byte[] content = resource.getContent();
-        if (content == null) {
-            throw new IOException(String.format("Resource is empty: '%s'", resource.getAbsPath()));
-        }
-        java.io.FileOutputStream fo = new java.io.FileOutputStream(out);
-        fo.write(content);
-        fo.close();
+    public void formatResourceToFile(byte[] content, final String sourceLocation, File toFile) throws IOException {
+        FileUtils.write(toFile, formatResource(content, sourceLocation));
     }
 
     public File getTargetManifestDir(Platform platform){
@@ -201,17 +198,12 @@ public class BundleHelper {
     // Each manifest has to be named like the default name (much easier for the server), even the main manifest file
     // This isn't an issue since there cannot be two manifests in the same folder
     public List<ExtenderResource> writeManifestFiles(Platform platform, File manifestDir) throws CompileExceptionError, IOException {
+        updateTemplateProperties();
         List<ExtenderResource> resolvedManifests = new ArrayList<>();
-
-        String title = projectProperties.getStringValue("project", "title", "Unnamed");
-        String exeName = BundleHelper.projectNameToBinaryName(title);
-        HashMap<String, String> props = new HashMap<>();
-
         IResource mainManifest;
         String mainManifestName;
-        Map<String, Object> properties = new HashMap<>();
 
-        properties.put("exe-name", exeName);
+        IBundler bundler = getOrCreateBundler();
 
         // The new code path we wish to use
         mainManifest = bundler.getManifestResource(project, platform);
@@ -220,8 +212,6 @@ public class BundleHelper {
         }
 
         mainManifestName = bundler.getMainManifestName(platform);
-
-        bundler.updateManifestProperties(project, platform, this.projectProperties, this.propertiesMap, properties);
 
         // First, list all extension manifests
         List<IResource> sourceManifests = ExtenderUtil.getExtensionPlatformManifests(project, platform);
@@ -236,7 +226,7 @@ public class BundleHelper {
                 parent.mkdirs();
             }
 
-            formatResourceToFile(properties, resource, manifest);
+            formatResourceToFile(resource, manifest);
 
             String path = resource.getPath();
             // Store the main manifest at the root (and not in e.g. builtins/manifests/...)
@@ -249,12 +239,50 @@ public class BundleHelper {
         return resolvedManifests;
     }
 
-    private File getAppManifestFile(Platform platform, File appDir) {
+    /**
+     * Copy a PrivacyInfo.xcprivacy to a target folder. The file will either be
+     * copied from the extender build results or if that doesn't exist it will
+     * copy from the privacy manifest set in game.project
+     * @param project
+     * @param platform
+     * @param appDir Directory to copy to
+     */
+    public static void copyPrivacyManifest(Project project, Platform platform, File appDir) throws IOException {
+        final String privacyManifestFilename = "PrivacyInfo.xcprivacy";
+        File targetPrivacyManifest = new File(appDir, privacyManifestFilename);
+
+        File extenderBuildDir = new File(project.getRootDirectory(), "build");
+        File extenderBuildPlatformDir = new File(extenderBuildDir, platform.getExtenderPair());
+
+        File extenderPrivacyManifest = new File(extenderBuildPlatformDir, privacyManifestFilename);
+        if (extenderPrivacyManifest.exists()) {
+            FileUtils.copyFile(extenderPrivacyManifest, targetPrivacyManifest);
+        }
+        else {
+            IResource defaultPrivacyManifest = project.getResource(platform.getExtenderPaths()[0], "privacymanifest", false);
+            if (defaultPrivacyManifest.exists()) {
+                ExtenderUtil.writeResourceToFile(defaultPrivacyManifest, targetPrivacyManifest);
+            }
+        }
+    }
+
+    public void updateTemplateProperties() throws CompileExceptionError, IOException {
+        String title = this.projectProperties.getStringValue("project", "title", "Unnamed");
+        String exeName = BundleHelper.projectNameToBinaryName(title);
+        this.templateProperties.put("exe-name", exeName);
+
+        IBundler bundler = getOrCreateBundler();
+        bundler.updateManifestProperties(project, platform, this.projectProperties, this.propertiesMap, this.templateProperties);
+    }
+
+  private File getAppManifestFile(Platform platform, File appDir) throws CompileExceptionError {
+        IBundler bundler = getOrCreateBundler();
         String name = bundler.getMainManifestTargetPath(platform);
         return new File(appDir, name);
     }
 
-    private String getMainManifestName(Platform platform) {
+    private String getMainManifestName(Platform platform) throws CompileExceptionError {
+        IBundler bundler = getOrCreateBundler();
         return bundler.getMainManifestName(platform);
     }
 
@@ -727,7 +755,7 @@ public class BundleHelper {
             String path = resource.getPath(); // The relative path
             if (uniquePaths.contains(path)) {
                 IResource iresource = ExtenderUtil.getResource(path, resources);
-                throw new CompileExceptionError(iresource, -1, "Duplicate file in upload zip: " + resource.getAbsPath());
+                throw new CompileExceptionError(iresource, -1, "Duplicate file in upload zip: " + resource.getPath());
             }
             uniquePaths.add(path);
         }
@@ -738,7 +766,7 @@ public class BundleHelper {
 
         try {
             zipFile = File.createTempFile("build_" + sdkVersion, ".zip");
-            zipFile.deleteOnExit();
+            FileUtil.deleteOnExit(zipFile);
         } catch (IOException e) {
             throw new CompileExceptionError("Failed to create temp zip file", e.getCause());
         }
@@ -793,7 +821,7 @@ public class BundleHelper {
                         // If it's the app manifest, let's translate it back into its original name
                         if (info.resource != null && info.resource.endsWith(ExtenderClient.appManifestFilename)) {
                             for (ExtenderResource extResource : allSource) {
-                                if (extResource.getAbsPath().endsWith(info.resource)) {
+                                if (((ExtenderUtil.FSAppManifestResource)extResource).getAbsPath().endsWith(info.resource)) {
                                     issueResource = ((ExtenderUtil.FSAppManifestResource)extResource).getResource();
                                     info.message = info.message.replace(extResource.getPath(), issueResource.getPath());
                                     break;

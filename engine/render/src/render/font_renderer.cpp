@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -117,9 +117,6 @@ namespace dmRender
 
         ~FontMap()
         {
-            if (m_GlyphData) {
-                free(m_GlyphData);
-            }
             if (m_Cache) {
                 free(m_Cache);
             }
@@ -311,8 +308,7 @@ namespace dmRender
         }
 
         // release previous glyph data bank
-        if (font_map->m_GlyphData) {
-            free(font_map->m_GlyphData);
+        if (font_map->m_Cache) {
             free(font_map->m_Cache);
             free(font_map->m_CellTempData);
         }
@@ -402,7 +398,7 @@ namespace dmRender
         return font_map->m_Material;
     }
 
-    void InitializeTextContext(HRenderContext render_context, uint32_t max_characters)
+    void InitializeTextContext(HRenderContext render_context, uint32_t max_characters, uint32_t max_batches)
     {
         DM_STATIC_ASSERT(sizeof(GlyphVertex) % 16 == 0, Invalid_Struct_Size);
         DM_STATIC_ASSERT( MAX_FONT_RENDER_CONSTANTS == MAX_TEXT_RENDER_CONSTANTS, Constant_Arrays_Must_Have_Same_Size );
@@ -438,8 +434,6 @@ namespace dmRender
 
         dmGraphics::DeleteVertexStreamDeclaration(stream_declaration);
 
-        // Arbitrary number
-        const uint32_t max_batches = 128;
         text_context.m_ConstantBuffers.SetCapacity(max_batches); // 1:1 index mapping with render object
         text_context.m_RenderObjects.SetCapacity(max_batches);
         text_context.m_RenderObjectIndex = 0;
@@ -1057,7 +1051,7 @@ namespace dmRender
         GlyphVertex* vertices = (GlyphVertex*)text_context.m_ClientBuffer;
 
         if (text_context.m_RenderObjectIndex >= text_context.m_RenderObjects.Size()) {
-            dmLogWarning("Fontrenderer: Render object count reached limit (%d)", text_context.m_RenderObjectIndex);
+            dmLogWarning("Fontrenderer: Render object count reached limit (%d). Increase the capacity with graphics.max_font_batches", text_context.m_RenderObjectIndex);
             return;
         }
 
@@ -1257,6 +1251,7 @@ namespace dmRender
         return size;
     }
 
+    // Test functions begin
     bool VerifyFontMapMinFilter(dmRender::HFontMap font_map, dmGraphics::TextureFilter filter)
     {
         return font_map->m_MinFilter == filter;
@@ -1266,4 +1261,10 @@ namespace dmRender
     {
         return font_map->m_MagFilter == filter;
     }
+
+    const void* GetGlyphData(HFontMap font_map)
+    {
+        return font_map->m_GlyphData;
+    }
+    // Test functions end
 }

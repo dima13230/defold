@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The Defold Foundation
+// Copyright 2020-2024 The Defold Foundation
 // Copyright 2014-2020 King
 // Copyright 2009-2014 Ragnar Svensson, Christian Murray
 // Licensed under the Defold License version 1.0 (the "License"); you may not use
@@ -854,10 +854,10 @@ namespace dmResource
             return false;
         }
 
-        dmLoadQueue::PreloadInfo info;
+        dmLoadQueue::PreloadInfo info = {};
         info.m_HintInfo.m_Preloader = preloader;
         info.m_HintInfo.m_Parent    = index;
-        info.m_Function             = req->m_PathDescriptor.m_ResourceType->m_PreloadFunction;
+        info.m_CompleteFunction     = req->m_PathDescriptor.m_ResourceType->m_PreloadFunction;
         info.m_Context              = req->m_PathDescriptor.m_ResourceType->m_Context;
 
         // If we can't add the request to the load queue it is because the queue is full
